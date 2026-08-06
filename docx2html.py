@@ -389,6 +389,19 @@ def _render_tabbed(text, style_str, tab_stops, tab_state):
     return ''.join(out)
 
 
+# Word 的正文段落常常不写任何 <w:spacing>，但 Word 应用本身仍会对 Normal 样式
+# 施加一个默认的「段后距」（space-after）。浏览器默认 margin:0 会把这个高度丢干净，
+# 导致整页被纵向压缩、章节条/照片整体向上漂移几十毫米。
+# 这里主动补一个与 Word 默认一致的段后距，消除漂移。取值经与 PDF 真值逐带比对校准。
+DEFAULT_SPACE_AFTER_PT = 5.0
+# 带背景形状的「小节条/章节标题」（如简历里的灰色章节条）通常靠下方空段落撑出间隙，
+# 但浏览器里空段落会塌缩为 0 高度，导致条紧贴正文。这里给这类有显式精确行高的
+# 段落补一个段后距，使条与下方正文之间留出与 PDF 一致间隙（值经 PDF 真值比对校准）。
+# 注意：小节条下方加段后距会向下级联，故同步下调 DEFAULT_SPACE_AFTER_PT 抵消，
+# 整体纵向位置仍对齐 PDF 真值（Word 正文段后距本就约 3~4pt，而非 6.5pt）。
+BAR_SPACE_AFTER_PT = 8.0
+
+
 def parse_paragraph(p_elem):
     """解析段落，返回 HTML 字符串。可能包含分页符 \\f"""
     if p_elem is None:
@@ -400,14 +413,25 @@ def parse_paragraph(p_elem):
     spacing_before = 0
     spacing_after = 0
     tab_stops = []
+    has_spacing_elem = False
 
     if ppr is not None:
         jc = gchild(ppr, 'jc', 'w')
         if jc is not None:
             align = gattr(jc, 'val', 'w')
         spacing = gchild(ppr, 'spacing', 'w')
+        has_spacing_elem = spacing is not None
         spacing_line, spacing_before, spacing_after = parse_spacing(spacing)
         tab_stops = parse_tab_stops(ppr)
+
+    # 检测段落最大字号，用于给大字号标题/横幅施加更宽松的行距（贴近 Word 标题行高）。
+    max_sz = 0
+    for _r in gchildren(p_elem, 'r', 'w'):
+        for _sz in _r.findall(f'.//{{{W}}}sz'):
+            try:
+                max_sz = max(max_sz, int(gattr(_sz, 'val', 'w') or 0))
+            except ValueError:
+                pass
 
     runs = gchildren(p_elem, 'r', 'w')
     if not runs:
@@ -453,18 +477,37 @@ def parse_paragraph(p_elem):
     p_style_parts = []
     if align:
         p_style_parts.append(f'text-align: {align}')
+    # 行距：优先 docx 显式 w:spacing 的 line；否则正文继承 body 的 1.40×。
+    # 大字号标题/横幅（≥24pt）用更宽松的 1.60×，贴近 Word 标题行高（否则横幅偏矮）。
     if spacing_line:
         p_style_parts.append(f'line-height: {spacing_line}')
+    elif max_sz >= 48:
+        p_style_parts.append('line-height: 1.60')
+    # 上下边距：优先用 docx 显式 <w:spacing> 的 before/after；
+    # 若段落完全没有任何 <w:spacing>（Word 正文常态），浏览器 margin:0 会丢失
+    # Word 默认段后距 → 整页纵向压缩。这里补一个与 Word 默认一致的段后距；
+    # 上边距归零，避免浏览器默认 1em 顶距。段间靠 CSS margin 折叠（与 Word 一致，
+    # 相邻段只保留较大者而非相加），故对所有段统一施加也不会重复累加。
     if spacing_before:
         p_style_parts.append(f'margin-top: {spacing_before}pt')
+    else:
+        p_style_parts.append('margin-top: 0')
     if spacing_after:
         p_style_parts.append(f'margin-bottom: {spacing_after}pt')
+    elif not has_spacing_elem:
+        p_style_parts.append(f'margin-bottom: {DEFAULT_SPACE_AFTER_PT}pt')
+    else:
+        # 段落有显式 <w:spacing> 但无 after：多为带背景形状的「小节条/标题」
+        # （如简历灰色章节条，有精确行高但下方空段落塌缩）。补一个段后距留出间隙。
+        if spacing_line is not None:
+            p_style_parts.append(f'margin-bottom: {BAR_SPACE_AFTER_PT}pt')
+        else:
+            p_style_parts.append('margin-bottom: 0')
+    p_style_parts.append('padding: 0')
 
     p_style = '; '.join(p_style_parts)
     inner = ''.join(run_html_parts)
-    if p_style:
-        return f'<p style="{p_style}; margin: 0; padding: 0;">{inner}</p>'
-    return f'<p style="margin: 0; padding: 0;">{inner}</p>'
+    return f'<p style="{p_style}">{inner}</p>'
 
 
 def parse_txbx_content(txbx_elem):
@@ -567,20 +610,25 @@ def parse_preset_geom(prst, ext_cx, ext_cy, fill_color, line_color, line_w_pt, n
     if prst == 'rect':
         d = f'M 0 0 L {w} 0 L {w} {h} L 0 {h} Z'
     elif prst == 'line':
-        if w >= h * 4:
-            d = f'M 0 {h // 2} L {w} {h // 2}'        # 近似水平
-        elif h >= w * 4:
-            d = f'M {w // 2} 0 L {w // 2} {h}'        # 近似垂直
-        else:
-            d = f'M 0 0 L {w} {h}'                    # 斜线保留原方向
-        stroke_attr = line_color or fill_attr
-        fill_attr = 'none'
+        # Word 的"直接连接符"在 PDF 导出时被渲染为"填充细矩形"（fill=线颜色），
+        # 而不是描边路径。若按 SVG <path stroke> 渲染，在 viewBox+preserveAspectRatio="none"
+        # 下 0.75pt 笔画会被纵向压扁到几乎不可见（这就是"横线不显示"的原因）。
+        # 改为输出 <rect fill=线色>，与 PDF 矢量事实完全一致；细长矩形天然就是可见的实心条。
+        rect_fill = line_color or fill_attr
+        svg = (f'<svg style="position:absolute;top:0;left:0;width:100%;height:100%;overflow:visible;" '
+               f'viewBox="0 0 {w} {h}" preserveAspectRatio="none">'
+               f'<rect x="0" y="0" width="{w}" height="{h}" fill="{rect_fill}" />'
+               f'</svg>')
+        return svg
     elif prst == 'rtTriangle':
-        # OOXML 标准 preset：直角在左上 (l,t)，即 M 0 0 L w 0 L 0 h Z。
+        # OOXML 标准 preset（ECMA-376）的 rtTriangle：直角在左下角 (l,b)。
+        #   顶点顺序：moveTo(l,b) → lnTo(l,t) → lnTo(r,b)，即 (0,h) 左下、(0,0) 左上、(w,h) 右下。
         # 旋转(rot)/翻转(flipH/flipV) 由下方通用变换统一施加，这里只写标准几何，
-        # 从而保证对任意文档、任意旋转角都能按 OOXML 规范正确还原（已用本仓库 PDF
-        # 原版矢量顶点核验：rot=180° 时直角落在右下，与标准几何+180°旋转一致）。
-        d = f'M 0 0 L {w} 0 L 0 {h} Z'
+        # 从而保证对任意文档、任意旋转角都能按 OOXML 规范正确还原。
+        # 本仓库实测：docx 中 6 个 rtTriangle 均带 rot=180°(无 flip)；
+        # 用此“直角在左下”的标准几何 + 180° 旋转，直角恰好落在右上，与 PDF 原版矢量顶点完全一致。
+        # （早期写成“直角在左上”的版本，转 180° 后直角落在右下，与 PDF 相比整体上下翻转，方向错误。）
+        d = f'M 0 0 L 0 {h} L {w} {h} Z'
     elif prst == 'triangle':
         d = f'M {w//2} 0 L {w} {h} L 0 {h} Z'
     elif prst == 'ellipse':
@@ -635,9 +683,70 @@ def parse_preset_geom(prst, ext_cx, ext_cy, fill_color, line_color, line_w_pt, n
 
 
 # ===================================================================
+#  组合(嵌套组)坐标变换
+# ===================================================================
+def parse_group_transform(node):
+    """读取一个组合节点(wgp/grpSp)的 grpSpPr，返回其本地坐标变换。
+
+    返回 (off_x, off_y, chOff_x, chOff_y, chExt_x, chExt_y, sx, sy)。
+    子坐标 c 经该变换映射到父坐标：d = off + (c - chOff) * (sx, sy)，
+    其中真实的组缩放为 sx = ext.x / chExt.x, sy = ext.y / chExt.y。
+
+    注意：缩放必须用 chExt（子坐标空间尺寸）作分母，绝不能用 chOff
+    （chOff 只是子坐标原点的偏移量，通常极小，误用它会得到荒谬的放大倍数）。"""
+    if node is None:
+        return 0, 0, 0, 0, 0, 0, 1.0, 1.0
+    grpSpPr = None
+    for c in node:
+        if isinstance(c.tag, str) and c.tag.split('}')[-1] == 'grpSpPr':
+            grpSpPr = c
+            break
+    if grpSpPr is None:
+        return 0, 0, 0, 0, 0, 0, 1.0, 1.0
+    xf = grpSpPr.find(f'{{{A}}}xfrm')
+    if xf is None:
+        return 0, 0, 0, 0, 0, 0, 1.0, 1.0
+    off = xf.find(f'{{{A}}}off'); ext = xf.find(f'{{{A}}}ext')
+    chOff = xf.find(f'{{{A}}}chOff'); chExt = xf.find(f'{{{A}}}chExt')
+    gox = int(off.get('x') or 0) if off is not None else 0
+    goy = int(off.get('y') or 0) if off is not None else 0
+    gex = int(ext.get('cx') or 0) if ext is not None else 0
+    gey = int(ext.get('cy') or 0) if ext is not None else 0
+    gchox = int(chOff.get('x') or 0) if chOff is not None else 0
+    gchoy = int(chOff.get('y') or 0) if chOff is not None else 0
+    gchex = int(chExt.get('cx') or 0) if chExt is not None else 0
+    gchey = int(chExt.get('cy') or 0) if chExt is not None else 0
+    gsx = (gex / gchex) if gchex else 1.0
+    gsy = (gey / gchey) if gchey else 1.0
+    return gox, goy, gchox, gchoy, gchex, gchey, gsx, gsy
+
+
+def render_group(node, tx, ty, sx, sy, fallback_cx, fallback_cy,
+                 all_elements, rel_height, behind_doc):
+    """递归渲染组合节点，正确叠加各级嵌套组的 chOff/chExt 坐标缩放。
+    tx/ty/sx/sy 为该节点"之前"已累积的变换，使得：
+        absolute = (tx, ty) + child_coord * (sx, sy)。"""
+    gox, goy, gchox, gchoy, gchex, gchey, gsx, gsy = parse_group_transform(node)
+    nsx = sx * gsx
+    nsy = sy * gsy
+    ntx = tx + (gox - gchox * gsx) * sx
+    nty = ty + (goy - gchoy * gsy) * sy
+    for child in list(node):
+        lname = child.tag.split('}')[-1] if isinstance(child.tag, str) else ''
+        if lname == 'wsp':
+            html = parse_shape(child, ntx, nty, nsx, nsy,
+                               fallback_cx, fallback_cy, is_direct_shape=False)
+            if html:
+                all_elements.append((rel_height, behind_doc == '1', html))
+        elif lname in ('wgp', 'grpSp'):
+            render_group(child, ntx, nty, nsx, nsy,
+                         fallback_cx, fallback_cy, all_elements, rel_height, behind_doc)
+
+
+# ===================================================================
 #  形状解析
 # ===================================================================
-def parse_shape(wsp, anchor_h_offset, anchor_v_offset, anchor_cx, anchor_cy,
+def parse_shape(wsp, tx, ty, sx, sy, fallback_cx, fallback_cy,
                 is_direct_shape=False):
     if wsp is None:
         return ''
@@ -670,7 +779,7 @@ def parse_shape(wsp, anchor_h_offset, anchor_v_offset, anchor_cx, anchor_cy,
             if is_direct_shape and ext is not None:
                 ext_cx = int(gattr(ext, 'cx', 'a') or '0')
                 ext_cy = int(gattr(ext, 'cy', 'a') or '0')
-                if ext_cx == anchor_cx and ext_cy == anchor_cy:
+                if ext_cx == fallback_cx and ext_cy == fallback_cy:
                     child_off_x = 0
                     child_off_y = 0
                 else:
@@ -760,16 +869,16 @@ def parse_shape(wsp, anchor_h_offset, anchor_v_offset, anchor_cx, anchor_cy,
         txbx_content = gchild(txbx, 'txbxContent', 'w')
         txbx_content_html = parse_txbx_content(txbx_content)
 
-    abs_x_emu = anchor_h_offset + child_off_x
-    abs_y_emu = anchor_v_offset + child_off_y
+    abs_x_emu = tx + child_off_x * sx
+    abs_y_emu = ty + child_off_y * sy
     is_line = prst_geom is not None and gattr(prst_geom, 'prst', 'a') == 'line'
     if is_line:
         # 线形：直接使用自身 ext（某一维为 0 表示一维线），不要回退到组尺寸
-        w_emu = child_ext_cx
-        h_emu = child_ext_cy
+        w_emu = child_ext_cx * sx
+        h_emu = child_ext_cy * sy
     else:
-        w_emu = child_ext_cx if child_ext_cx > 0 else anchor_cx
-        h_emu = child_ext_cy if child_ext_cy > 0 else anchor_cy
+        w_emu = child_ext_cx * sx if child_ext_cx > 0 else fallback_cx
+        h_emu = child_ext_cy * sy if child_ext_cy > 0 else fallback_cy
 
     x_mm = emu_to_mm(abs_x_emu)
     y_mm = emu_to_mm(abs_y_emu)
@@ -919,7 +1028,7 @@ def estimate_paragraph_height_emu(p_elem):
 # ===================================================================
 #  表格解析
 # ===================================================================
-def parse_table(tbl_elem, current_y_emu, mar_emu, page_w_emu):
+def parse_table(tbl_elem, current_y_emu, mar_emu, page_w_emu, mar_top_emu, rels, image_data):
     """解析 w:tbl 表格，返回 HTML + 估算高度"""
     if tbl_elem is None:
         return '', 0
@@ -942,13 +1051,59 @@ def parse_table(tbl_elem, current_y_emu, mar_emu, page_w_emu):
     if tbl_w == 0:
         tbl_w = page_w_emu - 2 * mar_emu
 
+    # 单元格默认边距（tblCellMar），用于校正单元格内绝对定位浮动元素的横向参考点。
+    # Word 的 anchor offset 是相对「单元格内容区」（已扣除 left/right margin）的，
+    # 而 HTML position:absolute 是相对 td 的 padding 盒（此处 td 无 padding），
+    # 故需把单元格 left/top margin 补偿进浮动元素的偏移，照片才不会整体偏左/偏上。
+    # 若表格未显式定义 tblCellMar，回退 Word 默认值 108 twips (≈1.9mm)。
+    cell_margin_l_emu = 108 * 635
+    cell_margin_t_emu = 0
+    if tbl_pr is not None:
+        tcm = gchild(tbl_pr, 'tblCellMar', 'w')
+        if tcm is not None:
+            for side in ('left', 'top'):
+                m = gchild(tcm, side, 'w')
+                if m is not None:
+                    val = gattr(m, 'w', 'w')
+                    if val:
+                        emu = int(val) * 635
+                        if side == 'left':
+                            cell_margin_l_emu = emu
+                        else:
+                            cell_margin_t_emu = emu
+
     # 收集行
     rows = gchildren(tbl_elem, 'tr', 'w')
     if not rows:
         return '', 0
 
-    table_html = '<table style="border-collapse: collapse; width: 100%;">'
+    # OOXML 表格默认 tblLayout="fixed"，对应 HTML 必须显式 table-layout: fixed，
+    # 否则浏览器按 table-layout: auto 把列宽按内容自动分配，我们设的 width: 13.5% 等
+    # 百分比会被忽略，导致列被压扁、内容竖排（"出生年月"被拆成 出/生/年/月）。
+    #
+    # 进一步：固定布局下，列结构由第一行的 td 决定，但表头行（如"个人简历"）常常
+    # 只有 1 个 colspan 单元格（width:100%），若按它定列则整表退化成 1 列，其他行的
+    # 多列内容会被压缩。正确做法是从 docx 的 <w:tblGrid> 读出每一列的真实宽度
+    # （gridCol w="dxa"），转换为百分比后输出为 <colgroup><col>——这样无论哪一行
+    # 先出现，列结构都是 5 列；再叠加 table-layout: fixed，单元格百分比才会被尊重。
+    grid_elem = gchild(tbl_elem, 'tblGrid', 'w')
+    grid_widths_pct = []
+    if grid_elem is not None:
+        cols = gchildren(grid_elem, 'gridCol', 'w')
+        grid_dxa = [int(gattr(c, 'w', 'w') or 0) for c in cols]
+        total_dxa = sum(grid_dxa) or tbl_w
+        grid_widths_pct = [w / total_dxa * 100 for w in grid_dxa]
+
+    colgroup_html = '<colgroup>'
+    for w_pct in grid_widths_pct:
+        colgroup_html += f'<col style="width: {w_pct:.2f}%;">'
+    colgroup_html += '</colgroup>'
+
+    table_html = (f'<table style="border-collapse: collapse; width: 100%; '
+                  f'table-layout: fixed;">{colgroup_html}')
     total_height_emu = 0
+
+    float_elements = []  # 保留返回兼容（单元格内浮动现已注入 <td>）
 
     for tr in rows:
         tr_height = 0
@@ -960,16 +1115,15 @@ def parse_table(tbl_elem, current_y_emu, mar_emu, page_w_emu):
                 if h_val:
                     tr_height = int(h_val) * 635
 
-        if tr_height == 0:
-            tr_height = int(20 * EMU_PER_PT)  # 默认约 20pt
-
-        total_height_emu += tr_height
-
-        table_html += '<tr>'
+        # 不为 trHeight=0 的行设默认值：保持 0，让浏览器按内容自动算行高，
+        # 否则每行都被强制一个固定高度，整体版式就会错乱。
+        tr_style = f' style="height: {emu_to_mm(tr_height):.2f}mm;"' if tr_height > 0 else ''
+        table_html += f'<tr{tr_style}>'
         cells = gchildren(tr, 'tc', 'w')
         for tc in cells:
             tc_pr = gchild(tc, 'tcPr', 'w')
             tc_w = 0
+            tc_grid_span = 1
             if tc_pr is not None:
                 tc_w_elem = gchild(tc_pr, 'tcW', 'w')
                 if tc_w_elem is not None:
@@ -980,6 +1134,11 @@ def parse_table(tbl_elem, current_y_emu, mar_emu, page_w_emu):
                             tc_w = int(int(w_val) / 5000 * tbl_w)
                         else:
                             tc_w = int(w_val) * 635
+                gs_elem = gchild(tc_pr, 'gridSpan', 'w')
+                if gs_elem is not None:
+                    gs_val = gattr(gs_elem, 'val', 'w')
+                    if gs_val:
+                        tc_grid_span = int(gs_val)
 
             # 单元格背景
             bg_color = ''
@@ -1006,15 +1165,31 @@ def parse_table(tbl_elem, current_y_emu, mar_emu, page_w_emu):
                                 b_color_val = f'#{b_color.upper()}' if b_color and b_color != 'auto' else '#000000'
                                 borders_style += f' border-{side}: {b_sz_pt}pt solid {b_color_val};'
 
-            # 解析单元格内容
+            # 解析单元格内容（文字）
             cell_html = ''
             for p in gchildren(tc, 'p', 'w'):
                 p_html = parse_paragraph(p)
                 if p_html:
                     cell_html += p_html
 
+            # 单元格内浮动元素：锚定在单元格里的 wp:anchor（图片/形状）。
+            # 例：简历模板右上角人像照片就是「固定在表格单元格内的浮动图片」，
+            # 之前 parse_table 只渲文字、漏掉 anchor，导致照片整张丢失。
+            #
+            # 定位策略：不按「页面绝对坐标」估算（表格行高由 CSS 决定，EMU 估算的
+            # 行顶会和真实渲染错位十几毫米）。改为把元素注入所在 <td> 内部、用
+            # position:absolute 相对该单元格定位，由浏览器按真实单元格位置渲染，
+            # 纵向天然对齐；横向偏移用 OOXML 的 column 偏移量（相对列左缘=单元格左缘）。
+            cell_anchors_html = ''
+            for anchor in tc.findall(f'.//{{{WP}}}anchor'):
+                cell_anchors_html += render_cell_anchor(
+                    anchor, rels, image_data, cell_margin_l_emu, cell_margin_t_emu)
+
             w_pct = (tc_w / tbl_w * 100) if tbl_w > 0 else 100
-            table_html += f'<td style="width: {w_pct:.1f}%;{bg_color}{borders_style} vertical-align: top;">{cell_html}</td>'
+            colspan_attr = f' colspan="{tc_grid_span}"' if tc_grid_span > 1 else ''
+            td_style = (f'position: relative; width: {w_pct:.1f}%;'
+                        f'{bg_color}{borders_style} vertical-align: top;')
+            table_html += f'<td{colspan_attr} style="{td_style}">{cell_html}{cell_anchors_html}</td>'
 
         table_html += '</tr>'
 
@@ -1028,7 +1203,260 @@ def parse_table(tbl_elem, current_y_emu, mar_emu, page_w_emu):
                 f'style="position: absolute; left: {emu_to_mm(mar_emu)}mm; top: {y_mm}mm; width: {w_mm}mm;">'
                 f'{table_html}</div>')
 
-    return div_html, total_height_emu
+    return div_html, total_height_emu, float_elements
+
+
+def get_default_font_size_pt(docx_dir):
+    """读取文档默认字号（半磅→pt）。
+
+    OOXML 里正文大多 run 不写 w:sz，而是继承 Normal 样式的字号。
+    之前转换器不给这些 run 设 font-size，浏览器就用默认 16px，导致整页偏大偏黑。
+    这里从 styles.xml 读出默认字号，交给 body 作为基准，无显式字号的 run 自动继承。
+
+    优先级：默认段落样式(w:default=1)的 w:sz > docDefaults/rPrDefault 的 w:sz > 10.5pt。
+    """
+    styles_path = os.path.join(docx_dir, 'word', 'styles.xml')
+    if not os.path.exists(styles_path):
+        return 10.5
+    try:
+        st = ET.parse(styles_path).getroot()
+        # 1) 默认段落样式的 sz
+        for st_node in st.iter(f'{{{W}}}style'):
+            if gattr(st_node, 'default', 'w') == '1' and gattr(st_node, 'type', 'w') == 'paragraph':
+                sz = st_node.find(f'.//{{{W}}}sz')
+                if sz is not None:
+                    return int(gattr(sz, 'val', 'w') or 21) / 2.0
+        # 2) docDefaults / rPrDefault 的 sz
+        dd = st.find(f'.//{{{W}}}rPrDefault/{{{W}}}rPr')
+        if dd is not None:
+            sz = dd.find(f'{{{W}}}sz')
+            if sz is not None:
+                return int(gattr(sz, 'val', 'w') or 21) / 2.0
+    except Exception:
+        pass
+    return 10.5
+
+
+def render_anchor(anchor, current_para_y, mar_left_emu, mar_top_emu, rels, image_data):
+    """渲染一个 wp:anchor 浮动元素（图片 / 形状 / 组合）。
+
+    返回 [(rel_height, behind_doc, html_str)]，坐标以「页面绝对 EMU」给出，
+    与顶层 body 浮动元素完全一致，可直接 append 到 all_elements / body_content_elements。
+
+    mar_left_emu 在此语义为「锚定参考列的左缘页面坐标」：
+      - 顶层段落里的 anchor：传 mar_left_emu（页面左边距），relativeFrom=column 即相对页面左缘；
+      - 表格单元格里的 anchor：传「该单元格所在列的左缘页面坐标」，relativeFrom=column
+        仍能正确换算到页面绝对坐标。
+    """
+    elements = []
+
+    ph = gchild(anchor, 'positionH', 'wp')
+    pv = gchild(anchor, 'positionV', 'wp')
+
+    h_relative = gattr(ph, 'relativeFrom', 'wp') if ph is not None else 'column'
+    v_relative = gattr(pv, 'relativeFrom', 'wp') if pv is not None else 'paragraph'
+
+    h_offset = 0
+    v_offset = 0
+    if ph is not None:
+        posoff = gchild(ph, 'posOffset', 'wp')
+        if posoff is not None:
+            h_offset = int(posoff.text)
+    if pv is not None:
+        posoff = gchild(pv, 'posOffset', 'wp')
+        if posoff is not None:
+            v_offset = int(posoff.text)
+
+    extent = gchild(anchor, 'extent', 'wp')
+    cx = int(gattr(extent, 'cx', 'wp') or '0') if extent is not None else 0
+    cy = int(gattr(extent, 'cy', 'wp') or '0') if extent is not None else 0
+
+    behind_doc = gattr(anchor, 'behindDoc', 'wp') or '0'
+    rel_height = int(gattr(anchor, 'relativeHeight', 'wp') or '0')
+
+    # 浮动参考点（页面绝对 EMU）
+    if h_relative == 'page':
+        real_h = h_offset
+    elif h_relative == 'margin':
+        real_h = mar_left_emu + h_offset
+    else:  # column / character / paragraph：相对「列左缘」（此处 mar_left_emu 已是列左缘）
+        real_h = mar_left_emu + h_offset
+
+    if v_relative == 'page':
+        real_v = v_offset
+    elif v_relative == 'margin':
+        real_v = mar_top_emu + v_offset
+    else:  # paragraph：相对段落顶
+        real_v = current_para_y + v_offset
+
+    # 组合 / 形状 / 图片
+    wpg = None
+    for e in anchor.iter():
+        if isinstance(e.tag, str) and e.tag.split('}')[-1] == 'wgp':
+            wpg = e
+            break
+
+    if wpg is not None:
+        render_group(wpg, real_h, real_v, 1.0, 1.0, cx, cy,
+                     elements, rel_height, behind_doc)
+    else:
+        wsps = anchor.findall(f'.//{{{WPS}}}wsp')
+        for wsp in wsps:
+            html_str = parse_shape(wsp, real_h, real_v, 1.0, 1.0, cx, cy, is_direct_shape=True)
+            if html_str:
+                elements.append((rel_height, behind_doc == '1', html_str))
+
+        pics = anchor.findall(f'.//{{{NS["pic"]}}}pic')
+        for pic_elem in pics:
+            blip = pic_elem.find(f'.//{{{A}}}blip')
+            if blip is not None:
+                embed = blip.get(f'{{{NS["r"]}}}embed', '')
+                target = rels.get(embed, '')
+                if target.startswith('media/'):
+                    img_file = target.split('/')[-1]
+                    if img_file in image_data:
+                        img_src = image_data[img_file]
+
+                        sp_pr = gchild(pic_elem, 'spPr', 'pic')
+                        pic_xfrm = gchild(sp_pr, 'xfrm', 'a') if sp_pr is not None else None
+
+                        if pic_xfrm is not None:
+                            off = gchild(pic_xfrm, 'off', 'a')
+                            ext = gchild(pic_xfrm, 'ext', 'a')
+                            if off is not None and ext is not None:
+                                pic_x = int(gattr(off, 'x', 'a') or '0')
+                                pic_y = int(gattr(off, 'y', 'a') or '0')
+                                pic_cx = int(gattr(ext, 'cx', 'a') or '0')
+                                pic_cy = int(gattr(ext, 'cy', 'a') or '0')
+                            else:
+                                pic_x = pic_y = 0
+                                pic_cx = cx
+                                pic_cy = cy
+                        else:
+                            pic_x = pic_y = 0
+                            pic_cx = cx
+                            pic_cy = cy
+
+                        abs_x = real_h + pic_x
+                        abs_y = real_v + pic_y
+
+                        x_mm = emu_to_mm(abs_x)
+                        y_mm = emu_to_mm(abs_y)
+                        w_mm = emu_to_mm(pic_cx)
+                        h_mm = emu_to_mm(pic_cy)
+
+                        z_idx = rel_height - 251640000
+                        html_str = (f'<div class="docx-element image" '
+                                    f'style="position: absolute; left: {x_mm}mm; top: {y_mm}mm; '
+                                    f'width: {w_mm}mm; height: {h_mm}mm; z-index: {z_idx};">'
+                                    f'<img src="{img_src}" style="width:100%;height:100%;object-fit:fill;" />'
+                                    f'</div>')
+                        elements.append((rel_height, behind_doc == '1', html_str))
+
+    return elements
+
+
+def render_cell_anchor(anchor, rels, image_data, cell_margin_l_emu=0, cell_margin_t_emu=0):
+    """渲染「锚定在表格单元格内」的浮动元素，返回 HTML 片段（相对所在 <td> 定位）。
+
+    与 render_anchor（页面绝对坐标）不同：单元格内浮动元素若用页面坐标估算纵向位置，
+    会因表格行高由 CSS 实际渲染、与 EMU 估算不完全一致而错位十几毫米。
+    因此这里把元素注入 <td>（该 td 已设 position:relative），用 OOXML 的
+    positionH/positionV 偏移量作为相对该单元格左上角的 CSS 偏移，由浏览器按真实
+    单元格位置渲染，纵向天然对齐。
+
+    适用前提：单元格内 anchor 一般用 relativeFrom=column（横向，相对列左缘=单元格左缘）
+    与 relativeFrom=paragraph（纵向，相对段落顶≈单元格内容顶）。
+
+    cell_margin_l_emu / cell_margin_t_emu：单元格内容区 left/top 边距（EMU）。
+    Word 的 anchor offset 是相对「内容区」（已扣除单元格 margin）给出的，而 HTML
+    position:absolute 相对 td 的 padding 盒（本转换器未给 td 设 padding），因此要把
+    单元格 left/top margin 补回偏移量，浮动照片才不会相对 PDF 整体偏左/偏上约 1.9mm。
+    """
+    out = []
+
+    ph = gchild(anchor, 'positionH', 'wp')
+    pv = gchild(anchor, 'positionV', 'wp')
+    h_relative = gattr(ph, 'relativeFrom', 'wp') if ph is not None else 'column'
+    v_relative = gattr(pv, 'relativeFrom', 'wp') if pv is not None else 'paragraph'
+
+    h_offset = 0
+    v_offset = 0
+    if ph is not None:
+        posoff = gchild(ph, 'posOffset', 'wp')
+        if posoff is not None:
+            h_offset = int(posoff.text)
+    if pv is not None:
+        posoff = gchild(pv, 'posOffset', 'wp')
+        if posoff is not None:
+            v_offset = int(posoff.text)
+
+    # 补偿单元格内容区边距：Word anchor offset 相对内容区（已扣 margin），
+    # HTML 绝对定位相对 td padding 盒（无 padding），故加回 left/top margin。
+    h_offset += cell_margin_l_emu
+    v_offset += cell_margin_t_emu
+
+    extent = gchild(anchor, 'extent', 'wp')
+    cx = int(gattr(extent, 'cx', 'wp') or '0') if extent is not None else 0
+    cy = int(gattr(extent, 'cy', 'wp') or '0') if extent is not None else 0
+    behind_doc = gattr(anchor, 'behindDoc', 'wp') or '0'
+
+    # 形状
+    for wsp in anchor.findall(f'.//{{{WPS}}}wsp'):
+        html_str = parse_shape(wsp, 0, 0, 1.0, 1.0, cx, cy, is_direct_shape=True)
+        if html_str:
+            out.append(_wrap_cell_anchor(html_str, h_offset, v_offset, cx, cy, behind_doc))
+
+    # 图片
+    for pic_elem in anchor.findall(f'.//{{{NS["pic"]}}}pic'):
+        blip = pic_elem.find(f'.//{{{A}}}blip')
+        if blip is not None:
+            embed = blip.get(f'{{{NS["r"]}}}embed', '')
+            target = rels.get(embed, '')
+            if target.startswith('media/'):
+                img_file = target.split('/')[-1]
+                if img_file in image_data:
+                    img_src = image_data[img_file]
+                    sp_pr = gchild(pic_elem, 'spPr', 'pic')
+                    pic_xfrm = gchild(sp_pr, 'xfrm', 'a') if sp_pr is not None else None
+                    if pic_xfrm is not None:
+                        off = gchild(pic_xfrm, 'off', 'a')
+                        ext = gchild(pic_xfrm, 'ext', 'a')
+                        if off is not None and ext is not None:
+                            pic_x = int(gattr(off, 'x', 'a') or '0')
+                            pic_y = int(gattr(off, 'y', 'a') or '0')
+                            pic_cx = int(gattr(ext, 'cx', 'a') or '0')
+                            pic_cy = int(gattr(ext, 'cy', 'a') or '0')
+                        else:
+                            pic_x = pic_y = 0
+                            pic_cx = cx
+                            pic_cy = cy
+                    else:
+                        pic_x = pic_y = 0
+                        pic_cx = cx
+                        pic_cy = cy
+                    left_emu = h_offset + pic_x
+                    top_emu = v_offset + pic_y
+                    w_mm = emu_to_mm(pic_cx)
+                    h_mm = emu_to_mm(pic_cy)
+                    l_mm = emu_to_mm(left_emu)
+                    t_mm = emu_to_mm(top_emu)
+                    z = 1000 if behind_doc != '1' else -1
+                    img_html = (f'<div style="position: absolute; left: {l_mm}mm; top: {t_mm}mm; '
+                                f'width: {w_mm}mm; height: {h_mm}mm; z-index: {z};">'
+                                f'<img src="{img_src}" style="width:100%;height:100%;object-fit:fill;" /></div>')
+                    out.append(img_html)
+    return ''.join(out)
+
+
+def _wrap_cell_anchor(inner_html, h_offset, v_offset, cx, cy, behind_doc):
+    l_mm = emu_to_mm(h_offset)
+    t_mm = emu_to_mm(v_offset)
+    w_mm = emu_to_mm(cx)
+    h_mm = emu_to_mm(cy)
+    z = 1000 if behind_doc != '1' else -1
+    return (f'<div style="position: absolute; left: {l_mm}mm; top: {t_mm}mm; '
+            f'width: {w_mm}mm; height: {h_mm}mm; z-index: {z};">{inner_html}</div>')
 
 
 # ===================================================================
@@ -1122,6 +1550,16 @@ def _do_convert(docx_dir, output_path, debug=False):
 
     content_w_emu = page_w_emu - mar_left_emu - mar_right_emu
     content_h_emu = page_h_emu - mar_top_emu - mar_bottom_emu
+
+    # 文档默认字号（半磅→pt）。无显式 w:sz 的正文 run 用它作基准，避免浏览器默认 16px 放大整页。
+    default_font_pt = get_default_font_size_pt(docx_dir)
+
+    # Word 正文段落（本模板每个段都显式 snapToGrid=0）不吸附基线网格，而是用 Word 的
+    # “单倍行距”——约 1.36× 字号（微软雅黑 10.5pt 正文下，比浏览器 normal(~1.15×) 略松）。
+    # 浏览器默认 normal 会让正文行偏挤、整页被压短，章节条/照片随之向上漂移。
+    # 用无量纲系数（相对字号）设置 body 行高，可随各 run 字号安全缩放，不裁切大字号（如 30pt 横幅）。
+    # 该校准值经与 PDF 真值逐带比对得到；若默认字体/模板差异较大可微调。
+    body_line_factor = 1.37
 
     # 读取图片
     image_data = {}
@@ -1226,21 +1664,21 @@ def _do_convert(docx_dir, output_path, debug=False):
                     if graphic_data is not None:
                         uri = graphic_data.get('uri', '')
 
-                is_group = 'wordprocessingGroup' in uri
-                is_direct = 'wordprocessingShape' in uri
+                # 组合：用 local-name 查找 wgp（避免命名空间前缀在 ElementTree.find 下的匹配问题）
+                wpg = None
+                for e in anchor.iter():
+                    if isinstance(e.tag, str) and e.tag.split('}')[-1] == 'wgp':
+                        wpg = e
+                        break
 
-                wpg = anchor.find(f'.//{{{WPG}}}wpg')
-
-                if wpg is not None or is_group:
-                    child_wsps = anchor.findall(f'.//{{{WPS}}}wsp')
-                    for wsp in child_wsps:
-                        html_str = parse_shape(wsp, real_h, real_v, cx, cy, is_direct_shape=False)
-                        if html_str:
-                            all_elements.append((rel_height, behind_doc == '1', html_str))
+                if wpg is not None:
+                    # 组合（可能含多级嵌套）：递归叠加各组 chOff/chExt 坐标变换
+                    render_group(wpg, real_h, real_v, 1.0, 1.0, cx, cy,
+                                 all_elements, rel_height, behind_doc)
                 else:
                     wsps = anchor.findall(f'.//{{{WPS}}}wsp')
                     for wsp in wsps:
-                        html_str = parse_shape(wsp, real_h, real_v, cx, cy, is_direct_shape=True)
+                        html_str = parse_shape(wsp, real_h, real_v, 1.0, 1.0, cx, cy, is_direct_shape=True)
                         if html_str:
                             all_elements.append((rel_height, behind_doc == '1', html_str))
 
@@ -1306,9 +1744,11 @@ def _do_convert(docx_dir, output_path, debug=False):
 
         elif tag == 'tbl':
             current_y = paragraph_y_emu
-            tbl_html, tbl_height = parse_table(child, current_y, mar_left_emu, page_w_emu)
+            tbl_html, tbl_height, tbl_floats = parse_table(
+                child, current_y, mar_left_emu, page_w_emu, mar_top_emu, rels, image_data)
             if tbl_html:
                 body_content_elements.append((0, False, tbl_html))
+            body_content_elements.extend(tbl_floats)
             paragraph_y_emu += tbl_height
 
         elif tag == 'sectPr':
@@ -1343,6 +1783,8 @@ def _do_convert(docx_dir, output_path, debug=False):
         body {{
             background: #e8e8e8;
             font-family: '微软雅黑', 'Microsoft YaHei', 'SimHei', 'SimSun', sans-serif;
+            font-size: {default_font_pt:.2f}pt;
+            {('line-height: %.3f;' % body_line_factor) if body_line_factor else ''}
             display: flex;
             justify-content: center;
             padding: 20px 0;

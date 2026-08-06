@@ -1,6 +1,7 @@
 .workbuddy/
 __pycache__/
 _docx_inspect/
+_inspect/
 compare/
 *.docx
 *_converted.html
@@ -9,3 +10,34 @@ compare/
 *_standardgeom.html
 docx_converted.html
 test_converted.html
+
+# --- 本机数据 / 批量产物（非仓库内容） ---
+PDF/
+converted_html/
+_batch_temp/
+A→【推荐】300+套单页简历/
+A→【推荐】300+套单页简历.zip
+_src_single.docx
+bands_out.txt
+_dbg.png
+_dbg.png.tmp.html
+
+# --- 开发期校准脚本（依赖 Pillow/PyMuPDF/无头 Edge，非转换器本体） ---
+measure_*.py
+_coverage.py
+_list_zip.py
+_cleanup.py
+_batch_convert.py
+
+# --- 各类对比渲染图 / 临时抽取 HTML ---
+compare_*.png
+html_116_*.png
+pdf_116_*.png
+单页116_*.png
+单页_*.html
+test_*.html
+test_*.png
+header_img.png
+image1.jpeg
+image1_view.png
+html_clip_chapter.png
