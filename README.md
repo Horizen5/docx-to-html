@@ -1,20 +1,62 @@
 # docx-to-html
 
-Convert `.docx` (Office Open XML) documents into **standalone, offline HTML**,
-preserving vector shapes, fills, thin divider lines, rotations/flips and real
-tab-stop positions — **no AI or cloud dependency**.
+把 `.docx`（Office Open XML）文档**离线**转换成独立 HTML，保留矢量形状、填充、细分割线、旋转/翻转以及真实的制表位，**不依赖 AI 或云端**。
 
-## Usage
+纯 Python 3，仅用标准库，零第三方依赖。
+
+---
+
+## 初衷（为什么做这个工具）
+
+写简历的软件基本都要收费；网上能找到不少好看的简历模板（`.docx` 格式），但用 Word 改内容、调排版特别费劲——字号、间距、分节线、小图标，稍微一动版式就乱，改完还不一定能压进一页。
+
+于是萌生了一个想法：
+
+> **把关心的 docx 模板转成 HTML → 在网页里填内容、调样式 → 再导出成 PDF。**
+
+HTML/CSS 改起来比 Word 直观得多，导出 PDF 用浏览器打印（矢量、不糊）也比各种位图方案清晰。这个仓库就是这条流水线的**第一环：docx → HTML 转换器**，把模板里那些形状、线条、制表位原样保住，后面才好在上面做填充和导出。
+
+---
+
+## 特性
+
+| 特性 | 说明 |
+| --- | --- |
+| 离线转换 | 不联网、不调用 AI，本地一键跑完 |
+| 形状还原 | 预设/自定义几何形状（含 `rtTriangle`、`line` 等），保留旋转与翻转 |
+| 线条还原 | 保留线宽、线色，以及标题下的细分割线（默认 0.75pt） |
+| 制表位 | 还原文档里真实的 tab 停靠位置，不再错位 |
+| 零依赖 | 仅用 Python 标准库，开箱即用 |
+
+---
+
+## 用法
 
 ```bash
 python docx2html.py input.docx -o output.html
 ```
 
-Pure Python 3, standard library only.
+参数说明：
 
-## Features
+- `input.docx`：待转换的 Word 文档
+- `-o output.html`：输出 HTML 路径（缺省时输出到同目录）
 
-- Offline conversion (no network / AI needed)
-- Preserves preset & custom geometry shapes with rotation and flip
-- Preserves line widths / colors and thin horizontal divider lines
-- Preserves real tab-stop positions from the document
+---
+
+## 项目结构
+
+```
+.
+├── docx2html.py   # 核心转换脚本（本仓库唯一源码）
+├── README.md      # 项目说明
+├── LICENSE        # MIT 许可证
+└── .gitignore     # 排除缓存、调试产物与私有目录
+```
+
+> `.gitignore` 已排除 `.workbuddy/`、各类调试/转换产物 HTML、源 `.docx` 等，仓库只保留可复用的源码与说明。
+
+---
+
+## 许可证
+
+MIT License
