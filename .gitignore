@@ -1,0 +1,11 @@
+.workbuddy/
+__pycache__/
+_docx_inspect/
+compare/
+*.docx
+*_converted.html
+*_debug.html
+*_standalone.html
+*_standardgeom.html
+docx_converted.html
+test_converted.html
