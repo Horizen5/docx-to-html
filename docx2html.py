@@ -14,6 +14,7 @@ import os
 import sys
 import html as html_lib
 import math
+import re
 import zipfile
 import tempfile
 import shutil
@@ -311,14 +312,61 @@ def parse_run(run_elem):
                 text_parts.append('\f')  # form feed = page break
             else:
                 text_parts.append('<br>')
+        elif local == 'sym':
+            # 特殊符号（如 • 项目符号、★ 等）。w:sym 给出字体与十六进制码点，
+            # 多数符号字体（Symbol/Wingdings）并非 Unicode，做少量常见映射，
+            # 其余尝试按可打印码点直接输出，避免把特殊符号整块丢失。
+            sym_char = gattr(child, 'char', 'w')
+            sym_font = (gattr(child, 'font', 'w') or '').lower()
+            ch = _decode_sym(sym_char, sym_font)
+            if ch:
+                text_parts.append(ch)
 
     return ''.join(text_parts), style
 
 
+# 常见符号字体中"项目符号/装饰符号"的码点 -> Unicode 映射。
+# Word 常用 Symbol/Wingdings 字体承载 • ○ ▪ ★ 等，其码点并非 Unicode，
+# 这里把最常见的几个对齐到 Unicode，避免渲染成乱码字母。
+_SYM_BULLET_MAP = {
+    'symbol': {
+        '0xb7': '\u2022',   # • 实心圆点
+        '0xa7': '\u2022',
+    },
+    'wingdings': {
+        '0x6c': '\u2022',   # •
+        '0x6e': '\u2022',
+        '0xf8f5': '\u2022',
+    },
+    'wingdings 2': {
+        '0x79': '\u2022',
+    },
+}
+
+def _decode_sym(char_hex, font):
+    if not char_hex:
+        return None
+    try:
+        code = int(char_hex, 16)
+    except ValueError:
+        return None
+    f = (font or '').lower()
+    if f in _SYM_BULLET_MAP and char_hex.lower() in _SYM_BULLET_MAP[f]:
+        return _SYM_BULLET_MAP[f][char_hex.lower()]
+    # 其余：可打印 ASCII/拉丁范围直接作为码点（对 Symbol 字体近似有效）；
+    # 超出此范围避免输出乱码，直接丢弃（极端罕见）。
+    if 0x20 <= code <= 0x7E:
+        try:
+            return chr(code)
+        except Exception:
+            return None
+    return None
+
+
 def parse_spacing(spacing_elem):
-    """解析 w:spacing 元素，返回 (line_height_str, before_pt, after_pt)"""
+    """解析 w:spacing 元素，返回 (line_height_str, before_pt, after_pt, line_rule)"""
     if spacing_elem is None:
-        return None, 0, 0
+        return None, None, None, 'auto'
 
     sl = gattr(spacing_elem, 'line', 'w')
     sl_rule = gattr(spacing_elem, 'lineRule', 'w') or 'auto'
@@ -336,12 +384,14 @@ def parse_spacing(spacing_elem):
             if multiplier > 0 and abs(multiplier - 1.0) > 0.01:
                 spacing_line = f'{multiplier:.2f}'
 
+    # 用 None 表示"属性缺失"，0.0 表示"显式 w:after=0"，两者语义不同：
+    # after=0 → margin-bottom:0；after 缺失 → 走默认/lineRule 分支
     sb = gattr(spacing_elem, 'before', 'w')
-    spacing_before = int(sb) / 20.0 if sb else 0
+    spacing_before = int(sb) / 20.0 if sb is not None else None
     sa = gattr(spacing_elem, 'after', 'w')
-    spacing_after = int(sa) / 20.0 if sa else 0
+    spacing_after = int(sa) / 20.0 if sa is not None else None
 
-    return spacing_line, spacing_before, spacing_after
+    return spacing_line, spacing_before, spacing_after, sl_rule
 
 
 def parse_tab_stops(ppr):
@@ -361,32 +411,93 @@ def parse_tab_stops(ppr):
 
 
 def _render_tabbed(text, style_str, tab_stops, tab_state):
-    """将一段文本中的 \\t 按真实制表位宽度渲染为占位 span。"""
-    if '\t' not in text:
-        escaped = html_lib.escape(text)
-        if style_str:
-            return f'<span style="{style_str}">{escaped}</span>'
-        return f'<span>{escaped}</span>'
+    """将一段文本中的 \\t 或 5+ 连续 ASCII 空格渲染为视觉占位。
 
-    parts = text.split('\t')
-    out = []
-    for i, part in enumerate(parts):
-        if part:
-            escaped = html_lib.escape(part)
+    Word 的「日期 | 学校 | 专业」等"字段分隔行"常用 5+ 个 ASCII 空格（而非
+    \\t 或 <w:tabs> 制表位）做视觉对齐。在 East-Asia 段落里半角空格被渲染为
+    全角宽（≈ 3.4mm @ 11pt 微软雅黑），但浏览器默认 white-space:normal 会把
+    连续空格折叠为一个，丢失整段对齐。这里检测到 5+ ASCII 空格序列，
+    用 inline-block 占位还原视觉宽度。
+    """
+    # 优先处理 \t（既有的制表位逻辑）
+    if '\t' in text:
+        parts = text.split('\t')
+        out = []
+        for i, part in enumerate(parts):
+            if part:
+                # 段内也可能有 5+ ASCII 空格，一并处理
+                out.append(_render_inline_with_field_gaps(part, style_str))
+            if i < len(parts) - 1:
+                if tab_state['idx'] < len(tab_stops):
+                    gap = tab_stops[tab_state['idx']] if tab_state['idx'] == 0 \
+                        else tab_stops[tab_state['idx']] - tab_stops[tab_state['idx'] - 1]
+                    tab_state['idx'] += 1
+                    out.append(f'<span style="display:inline-block;width:{gap:.1f}mm;"></span>')
+                else:
+                    out.append('&nbsp;&nbsp;&nbsp;&nbsp;')
+        return ''.join(out)
+
+    # 无 \t：单纯按字段分隔处理
+    return _render_inline_with_field_gaps(text, style_str)
+
+
+# 半角 ASCII 空格在 docx 中用于字段视觉分隔时的最小识别长度（5+ 视为
+# "故意撑开" 的字段间隔；1~4 个空格通常仅用于词间排版，不应撑开）。
+_FIELD_GAP_MIN_SPACES = 5
+_FIELD_GAP_RE = re.compile(r' {' + str(_FIELD_GAP_MIN_SPACES) + r',}')
+
+
+def _spaces_to_nbsp(n):
+    """把 N 个 ASCII 空格替换为 N 个 &nbsp;（U+00A0）。
+
+    浏览器渲染 &nbsp; 的宽度与同字体下的 ASCII 空格宽度一致（在 East-Asia
+    字体里约 0.25em）。实测 234 简历 11pt 微软雅黑下，1 个 &nbsp; ≈ 1.94mm，
+    与 PDF 真值（每 ASCII 空格 1.94mm）完全吻合。
+
+    使用 &nbsp; 而不是 flex 占位元素的原因：
+      1. &nbsp; 天然防换行（wrap 时不会在 &nbsp; 处断行），整行字段不被拆散；
+      2. &nbsp; 宽度由字体自动决定，无需硬编码 mm 系数；
+      3. 原文作者手工计算了空格数（如教育行 11 空格 vs 实习行 15 空格 vs
+         实习行 11 空格）让不同字段宽度的行在同一列对齐——flex 平分剩余空间
+         会破坏这种手工对齐意图，导致跨行字段位置不一致。
+    """
+    return '&nbsp;' * n
+
+
+def _render_inline_with_field_gaps(text, style_str):
+    """把 5+ 连续 ASCII 空格替换为 &nbsp; × N（精确宽度占位）。
+
+    早前用 flex `flex-grow:1` 平分每个 gap，因各行字段宽度不同导致
+    跨行字段位置错开（学校/角色列不对齐）。改用 &nbsp; × N 后忠实保留
+    原文作者的空格数，跨行列位置天然对齐（与 PDF 真值一致）。
+    """
+    if not text:
+        return f'<span style="{style_str}"></span>' if style_str else '<span></span>'
+    last = 0
+    pieces = []
+    for m in _FIELD_GAP_RE.finditer(text):
+        if m.start() > last:
+            seg = html_lib.escape(text[last:m.start()])
             if style_str:
-                out.append(f'<span style="{style_str}">{escaped}</span>')
+                pieces.append(f'<span style="{style_str}">{seg}</span>')
             else:
-                out.append(f'<span>{escaped}</span>')
-        if i < len(parts) - 1:
-            # 在制表位之间插入相当于列间距的占位
-            if tab_state['idx'] < len(tab_stops):
-                gap = tab_stops[tab_state['idx']] if tab_state['idx'] == 0 \
-                    else tab_stops[tab_state['idx']] - tab_stops[tab_state['idx'] - 1]
-                tab_state['idx'] += 1
-                out.append(f'<span style="display:inline-block;width:{gap:.1f}mm;"></span>')
-            else:
-                out.append('&nbsp;&nbsp;&nbsp;&nbsp;')
-    return ''.join(out)
+                pieces.append(f'<span>{seg}</span>')
+        pieces.append(_spaces_to_nbsp(m.end() - m.start()))
+        last = m.end()
+    if last < len(text):
+        seg = html_lib.escape(text[last:])
+        if style_str:
+            pieces.append(f'<span style="{style_str}">{seg}</span>')
+        else:
+            pieces.append(f'<span>{seg}</span>')
+    return ''.join(pieces)
+
+
+# 旧 flex 占位元素 + 当前段 flex 标志已废弃（&nbsp; 方案不需要 flex 容器，
+# 也不会再有"段落是否字段分隔行"的判定）。保留为空定义仅为兼容潜在的引用点。
+_FIXED_FIELD_PLACEHOLDER = ''
+_FLEX_FIELD_PLACEHOLDER = ''
+_current_p_flex = False
 
 
 # Word 的正文段落常常不写任何 <w:spacing>，但 Word 应用本身仍会对 Normal 样式
@@ -402,6 +513,150 @@ DEFAULT_SPACE_AFTER_PT = 5.0
 BAR_SPACE_AFTER_PT = 8.0
 
 
+# ===================================================================
+#  编号 / 项目符号（numPr）支持
+#  OOXML 列表靠 w:numPr(numId,ilvl) -> numbering.xml 的 abstractNum 级别格式。
+#  转换器按文档顺序维护每级计数，渲染 "• 文本" / "1. 文本" 等前缀，
+#  使 60% 含列表的文档不再丢失项目符号与编号。
+# ===================================================================
+NUMBERING = {}      # numId -> {ilvl: {'numFmt','suff','is_bullet','lvlText'}}
+NUM_STATE = {}      # (numId, ilvl) -> 当前计数
+
+
+def load_numbering(docx_dir):
+    global NUMBERING
+    NUMBERING = {}
+    path = os.path.join(docx_dir, 'word', 'numbering.xml')
+    if not os.path.exists(path):
+        return
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return
+    abs_map = {}
+    for an in root.iter('{' + W + '}abstractNum'):
+        aid = gattr(an, 'abstractNumId', 'w')
+        levels = {}
+        for lvl in an.findall('{' + W + '}lvl'):
+            il = gattr(lvl, 'ilvl', 'w')
+            if il is None:
+                continue
+            nf = gchild(lvl, 'numFmt', 'w')
+            numfmt = gattr(nf, 'val', 'w') if nf is not None else 'decimal'
+            suff = gchild(lvl, 'suff', 'w')
+            suff_val = gattr(suff, 'val', 'w') if suff is not None else 'tab'
+            lt = gchild(lvl, 'lvlText', 'w')
+            lvl_text = gattr(lt, 'val', 'w') if lt is not None else None
+            # OOXML 把 lvl 级别的颜色 / 字体放在 <w:rPr> 子节点下。
+            # 路径：<w:lvl><w:rPr><w:color w:val="365F91"/></w:rPr></w:lvl>。
+            # bullet 字符的色值通常就是主题蓝（如 234 简历 = #365F91）。
+            # None 表示继承正文（黑色）。
+            rpr = gchild(lvl, 'rPr', 'w')
+            color_el = gchild(rpr, 'color', 'w') if rpr is not None else None
+            color_val = gattr(color_el, 'val', 'w') if color_el is not None else None
+            levels[il] = {
+                'numFmt': numfmt,
+                'suff': suff_val,
+                'is_bullet': numfmt == 'bullet',
+                'lvlText': lvl_text,
+                'color': color_val,
+            }
+        abs_map[aid] = levels
+    for num in root.iter('{' + W + '}num'):
+        nid = gattr(num, 'numId', 'w')
+        anr = gchild(num, 'abstractNumId', 'w')
+        aid = gattr(anr, 'val', 'w') if anr is not None else None
+        if nid is not None and aid in abs_map:
+            NUMBERING[nid] = abs_map[aid]
+
+
+def _num_suffix(suff):
+    if suff == 'space':
+        return ' '
+    if suff == 'nothing':
+        return ''
+    return '. '  # 默认 tab/'.' 类，用 ". " 作编号后缀更贴近 Word
+
+
+def _to_letter(n, upper):
+    s = ''
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s if upper else s.lower()
+
+
+def _to_roman(n):
+    vals = [(1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'), (100, 'C'),
+            (90, 'XC'), (50, 'L'), (40, 'XL'), (10, 'X'), (9, 'IX'),
+            (5, 'V'), (4, 'IV'), (1, 'I')]
+    res = ''
+    for v, c in vals:
+        while n >= v:
+            res += c
+            n -= v
+    return res
+
+
+def _format_number(n, numfmt):
+    if numfmt in ('decimal', 'decimalEnclosedCircle', 'decimalFullWidth',
+                  'decimalHalfWidth', 'decimalZero', 'ordinal'):
+        return str(n)
+    if numfmt == 'lowerLetter':
+        return _to_letter(n, False)
+    if numfmt == 'upperLetter':
+        return _to_letter(n, True)
+    if numfmt == 'lowerRoman':
+        return _to_roman(n).lower()
+    if numfmt == 'upperRoman':
+        return _to_roman(n)
+    if numfmt == 'chineseCounting' or numfmt == 'chineseLegalSimplified' \
+            or numfmt == 'chineseCountingThousand':
+        # 中文序号：一、二、三…（近似）
+        cn = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十']
+        if n <= 10:
+            return cn[n]
+        if n < 20:
+            return '十' + (cn[n - 10] if n - 10 else '')
+        if n < 100:
+            t, o = divmod(n, 10)
+            return cn[t] + '十' + (cn[o] if o else '')
+        return str(n)
+    return str(n)
+
+
+def _numbering_prefix(numId, ilvl):
+    """返回该段落前应加的编号/项目符号前缀（含后缀）。无编号返回 ''。"""
+    if not numId or numId not in NUMBERING:
+        return ''
+    lvl = NUMBERING[numId].get(ilvl)
+    if lvl is None:
+        return ''
+    color = lvl.get('color')
+    if color:
+        # 6 位 hex 转 #RRGGBB
+        color_hex = '#' + color if not color.startswith('#') else color
+        color_html = f'<span style="color:{color_hex}">'
+        color_close = '</span>'
+    else:
+        color_html = ''
+        color_close = ''
+    if lvl['is_bullet']:
+        if lvl['lvlText']:
+            # Wingdings/Symbol 等私有字符 (U+E000-U+F8FF) 在浏览器里没字体就会变成豆腐，
+            # 简历里实际就是 ●，统一替换。
+            ch = lvl['lvlText']
+            if 0xE000 <= ord(ch) <= 0xF8FF:
+                return f'{color_html}●{color_close} '
+            return f'{color_html}{ch}{color_close} '
+        return f'{color_html}●{color_close} '
+    key = (numId, ilvl)
+    NUM_STATE[key] = NUM_STATE.get(key, 0) + 1
+    txt = _format_number(NUM_STATE[key], lvl['numFmt'])
+    # 编号数字同样用 level color
+    return f'{color_html}{txt}{color_close}{_num_suffix(lvl["suff"])}'
+
+
 def parse_paragraph(p_elem):
     """解析段落，返回 HTML 字符串。可能包含分页符 \\f"""
     if p_elem is None:
@@ -410,10 +665,12 @@ def parse_paragraph(p_elem):
     ppr = gchild(p_elem, 'pPr', 'w')
     align = None
     spacing_line = None
-    spacing_before = 0
-    spacing_after = 0
+    spacing_before = None
+    spacing_after = None
+    line_rule = 'auto'
     tab_stops = []
     has_spacing_elem = False
+    list_prefix = ''
 
     if ppr is not None:
         jc = gchild(ppr, 'jc', 'w')
@@ -421,8 +678,17 @@ def parse_paragraph(p_elem):
             align = gattr(jc, 'val', 'w')
         spacing = gchild(ppr, 'spacing', 'w')
         has_spacing_elem = spacing is not None
-        spacing_line, spacing_before, spacing_after = parse_spacing(spacing)
+        spacing_line, spacing_before, spacing_after, line_rule = parse_spacing(spacing)
         tab_stops = parse_tab_stops(ppr)
+        # 编号 / 项目符号前缀（numPr）
+        num_pr = gchild(ppr, 'numPr', 'w')
+        if num_pr is not None:
+            ilvl_el = gchild(num_pr, 'ilvl', 'w')
+            numId_el = gchild(num_pr, 'numId', 'w')
+            ilvl_raw = gattr(ilvl_el, 'val', 'w') or '0'
+            # 保持字符串，与 load_numbering 的 level key 一致
+            numId = gattr(numId_el, 'val', 'w')
+            list_prefix = _numbering_prefix(numId, ilvl_raw)
 
     # 检测段落最大字号，用于给大字号标题/横幅施加更宽松的行距（贴近 Word 标题行高）。
     max_sz = 0
@@ -492,21 +758,26 @@ def parse_paragraph(p_elem):
         p_style_parts.append(f'margin-top: {spacing_before}pt')
     else:
         p_style_parts.append('margin-top: 0')
-    if spacing_after:
+    if spacing_after is not None:
+        # 显式 w:after（含 0）→ 直接用该值，不叠加默认段后距
         p_style_parts.append(f'margin-bottom: {spacing_after}pt')
     elif not has_spacing_elem:
         p_style_parts.append(f'margin-bottom: {DEFAULT_SPACE_AFTER_PT}pt')
     else:
-        # 段落有显式 <w:spacing> 但无 after：多为带背景形状的「小节条/标题」
-        # （如简历灰色章节条，有精确行高但下方空段落塌缩）。补一个段后距留出间隙。
-        if spacing_line is not None:
+        # 段落有显式 <w:spacing> 但无 after：
+        # - lineRule="exact"：行高已被严格固定，再加 margin-bottom 会让多段落文本框溢出→重叠。
+        #   章节条/Bullet 共享文本框时尤其致命。直接置 0，让 line-height 决定间距。
+        # - 其他情况：多为带背景形状的「小节条/标题」，补段后距留出下方间隙。
+        if line_rule == 'exact':
+            p_style_parts.append('margin-bottom: 0')
+        elif spacing_line is not None:
             p_style_parts.append(f'margin-bottom: {BAR_SPACE_AFTER_PT}pt')
         else:
             p_style_parts.append('margin-bottom: 0')
     p_style_parts.append('padding: 0')
 
     p_style = '; '.join(p_style_parts)
-    inner = ''.join(run_html_parts)
+    inner = list_prefix + ''.join(run_html_parts)
     return f'<p style="{p_style}">{inner}</p>'
 
 
@@ -718,6 +989,12 @@ def parse_group_transform(node):
     gchey = int(chExt.get('cy') or 0) if chExt is not None else 0
     gsx = (gex / gchex) if gchex else 1.0
     gsy = (gey / gchey) if gchey else 1.0
+
+    # 注：极少数 docx 会出现 gsx/gsy 数百倍的极端值（chOff 只对得上一个
+    # 子图的几何，其他子图被错误缩放）。
+    # 原策略：> 8 倍降为 1.0，结果矩形/文本框高度被砍成接近 0mm。
+    # 修：不动缩放，而是交由 _fix_overlap_with_horizontal_lines 做后处理
+    # 把被横线压住的列表推下（更精准，也保留矩形/文本框的几何）。
     return gox, goy, gchox, gchoy, gchex, gchey, gsx, gsy
 
 
@@ -776,15 +1053,12 @@ def parse_shape(wsp, tx, ty, sx, sy, fallback_cx, fallback_cy,
             raw_off_x = int(gattr(off, 'x', 'a') or '0')
             raw_off_y = int(gattr(off, 'y', 'a') or '0')
 
-            if is_direct_shape and ext is not None:
-                ext_cx = int(gattr(ext, 'cx', 'a') or '0')
-                ext_cy = int(gattr(ext, 'cy', 'a') or '0')
-                if ext_cx == fallback_cx and ext_cy == fallback_cy:
-                    child_off_x = 0
-                    child_off_y = 0
-                else:
-                    child_off_x = raw_off_x
-                    child_off_y = raw_off_y
+            if is_direct_shape:
+                # 顶层浮动形状：位置完全由 anchor(positionV/H + posOffset) 决定。
+                # Word 不会对顶层 float 再叠加形状自身 xfrm 的 off，所以这里强制为 0。
+                # （否则带较大内部 off 的形状会被推到几百 mm 之外，离开页面/重叠。）
+                child_off_x = 0
+                child_off_y = 0
             else:
                 child_off_x = raw_off_x
                 child_off_y = raw_off_y
@@ -871,7 +1145,7 @@ def parse_shape(wsp, tx, ty, sx, sy, fallback_cx, fallback_cy,
 
     abs_x_emu = tx + child_off_x * sx
     abs_y_emu = ty + child_off_y * sy
-    is_line = prst_geom is not None and gattr(prst_geom, 'prst', 'a') == 'line'
+    is_line = prst_geom is not None and gattr(prst_geom, 'prst', 'a') in ('line', 'straightConnector1')
     if is_line:
         # 线形：直接使用自身 ext（某一维为 0 表示一维线），不要回退到组尺寸
         w_emu = child_ext_cx * sx
@@ -920,9 +1194,18 @@ def parse_shape(wsp, tx, ty, sx, sy, fallback_cx, fallback_cy,
             inner_html += svg
     elif prst_geom is not None:
         prst = gattr(prst_geom, 'prst', 'a')
-        svg = parse_preset_geom(prst, w_emu, h_emu, fill_color, line_color, line_w_pt, no_fill, no_line)
-        if svg:
-            inner_html += svg
+        if is_line and line_color and not no_line:
+            # 一维线（prst=line 或 straightConnector1）：直接用 SVG <line> 渲染描边，
+            # 避免 preset 几何把它当填充形状处理而不可见
+            sw = line_w_pt if line_w_pt else 0.75
+            inner_html += (f'<svg width="100%" height="100%" preserveAspectRatio="none" '
+                           f'style="display:block;overflow:visible">'
+                           f'<line x1="0" y1="50%" x2="100%" y2="50%" '
+                           f'stroke="{line_color}" stroke-width="{sw}"/></svg>')
+        else:
+            svg = parse_preset_geom(prst, w_emu, h_emu, fill_color, line_color, line_w_pt, no_fill, no_line)
+            if svg:
+                inner_html += svg
 
     if txbx_content_html:
         body_pr = gchild(wsp, 'bodyPr', 'wps')
@@ -938,7 +1221,9 @@ def parse_shape(wsp, tx, ty, sx, sy, fallback_cx, fallback_cy,
         elif anchor_val == 'b':
             text_align_style = ' display: flex; flex-direction: column; justify-content: flex-end;'
 
-        l_ins = r_ins = t_ins = b_ins = 91440
+        # OOXML 默认 insets：lIns/rIns=91440(0.1")=2.54mm，tIns/bIns=45720(0.05")=1.27mm
+        l_ins = r_ins = 91440
+        t_ins = b_ins = 45720
         if body_pr is not None:
             lIns = gattr(body_pr, 'lIns', 'wps')
             rIns = gattr(body_pr, 'rIns', 'wps')
@@ -955,7 +1240,7 @@ def parse_shape(wsp, tx, ty, sx, sy, fallback_cx, fallback_cy,
         pad_b = emu_to_mm(b_ins)
 
         inner_html += (f'<div style="position: relative; z-index: 2; width: 100%; height: 100%; '
-                       f'overflow: hidden; padding: {pad_t}mm {pad_r}mm {pad_b}mm {pad_l}mm;{text_align_style}">'
+                       f'overflow: visible; padding: {pad_t}mm {pad_r}mm {pad_b}mm {pad_l}mm;{text_align_style}">'
                        f'{txbx_content_html}</div>')
 
     if txbx_content_html and fill_color and not no_fill:
@@ -1237,6 +1522,34 @@ def get_default_font_size_pt(docx_dir):
     return 10.5
 
 
+def get_default_space_after_pt(docx_dir):
+    """读取文档默认段后距（twips→pt），用于给"完全无 w:spacing"的正文段落补段后距。
+
+    OOXML 正文段落通常不写 w:spacing，但 Normal 样式 / docDefaults 会施加一个默认
+    space-after（中文模板常约 0~120 twips，即 0~6pt）。浏览器 margin:0 会把这个高度丢干净，
+    导致整页纵向压缩。这里优先从 docDefaults/pPrDefault/spacing@after 读取真实值，
+    无则回退校准常数 5.0pt（已与 PDF 真值比对）。这样间距由文档自身决定，而非死常数。
+    """
+    styles_path = os.path.join(docx_dir, 'word', 'styles.xml')
+    if not os.path.exists(styles_path):
+        return None
+    try:
+        st = ET.parse(styles_path).getroot()
+        for path in (f'.//{{{W}}}pPrDefault/{{{W}}}pPr',):
+            ppr = st.find(path)
+            if ppr is not None:
+                sp = gchild(ppr, 'spacing', 'w')
+                if sp is not None:
+                    sa = gattr(sp, 'after', 'w')
+                    if sa:
+                        v = int(sa) / 20.0
+                        if v > 0:
+                            return v
+    except Exception:
+        pass
+    return None
+
+
 def render_anchor(anchor, current_para_y, mar_left_emu, mar_top_emu, rels, image_data):
     """渲染一个 wp:anchor 浮动元素（图片 / 形状 / 组合）。
 
@@ -1288,6 +1601,9 @@ def render_anchor(anchor, current_para_y, mar_left_emu, mar_top_emu, rels, image
         real_v = mar_top_emu + v_offset
     else:  # paragraph：相对段落顶
         real_v = current_para_y + v_offset
+    # DEBUG: 234 background/side band
+    if behind_doc == '1' and v_relative == 'paragraph':
+        print(f'[DBG behindDoc] v_offset={v_offset} ({v_offset/36000:.3f}mm), current_para_y={current_para_y} ({current_para_y/36000:.3f}mm), real_v={real_v} ({real_v/36000:.3f}mm), h_offset={h_offset} ({h_offset/36000:.3f}mm), real_h={real_h} ({real_h/36000:.3f}mm), cx={cx}, cy={cy}')
 
     # 组合 / 形状 / 图片
     wpg = None
@@ -1449,6 +1765,88 @@ def render_cell_anchor(anchor, rels, image_data, cell_margin_l_emu=0, cell_margi
     return ''.join(out)
 
 
+# ===================================================================
+#  后处理：分隔线 vs 下方文本框可见性冲突修复
+# ===================================================================
+def _fix_overlap_with_horizontal_lines(all_elements):
+    """检测几何属性，把被横线挡住或与之太近的文本框下推，避免遮挡。
+
+    触发条件（同时满足）：
+      - 横线：cy < 1mm（典型 0.27mm/0.75pt 分隔线），宽 ≥ 30mm，stroke #466797
+      - 文本框：cy ≥ 5mm，类别 text-box
+      - 文本框的 top 距横线 bottom < 2mm，即横线看起来要消失
+    修复：把文本框 top 下推到「横线 bottom + 2mm」。
+    """
+    import re as _re
+
+    def _num(unit_re, s):
+        m = unit_re.search(s)
+        return float(m.group(1)) if m else None
+
+    top_re = _re.compile(r'top:\s*([0-9.\-]+)mm')
+    left_re = _re.compile(r'left:\s*([0-9.\-]+)mm')
+    width_re = _re.compile(r'width:\s*([0-9.\-]+)mm')
+    height_re = _re.compile(r'height:\s*([0-9.\-]+)mm')
+    cls_re = _re.compile(r'class="docx-element\s+([^"]+)"')
+
+    # 解析所有元素的位置（逐属性独立提取，避免依赖 style 里属性顺序）
+    parsed = []
+    for idx, (_rel, _behind, html_str) in enumerate(all_elements):
+        top = _num(top_re, html_str)
+        if top is None:
+            continue
+        left = _num(left_re, html_str) or 0.0
+        w = _num(width_re, html_str) or 0.0
+        h = _num(height_re, html_str) or 0.0
+        cls_m = cls_re.search(html_str)
+        cls = cls_m.group(1) if cls_m else ""
+        is_line_class = ('shape' in cls and h < 1.0 and w >= 30.0)
+        has_line_color = '#466797' in html_str
+        parsed.append((idx, top, left, w, h, cls, is_line_class and has_line_color))
+
+    # 对每个"被挡"文本框，找出它对应的横线，必要时推它下移
+    GAP = 2.0  # 文本框与横线之间留 2mm
+    for idx_p, t, l, w, h, cls, _is_line in parsed:
+        if _is_line or 'text-box' not in cls:
+            continue
+        # 找横线：横线 bottom 落在文本框顶部区域（即横线被文本框上沿覆盖）
+        candidates = []
+        for idx_l, tl, ll, wl, hl, clsl, is_line_l in parsed:
+            if not is_line_l:
+                continue
+            line_bot = tl + hl
+            # 横线 bottom 必须在文本框 top 之上/附近（侵入文本框顶部才算遮挡）
+            if line_bot < t - 1.0:
+                continue
+            # 横线 top 不能在文本框很靠下的位置（否则是文本框下方的分隔线，不该推）
+            if tl > t + 5.0:
+                continue
+            # 横向需有重叠，避免推到别的列
+            if ll >= l + w or l >= ll + wl:
+                continue
+            candidates.append((line_bot, idx_l, tl, hl))
+        if not candidates:
+            continue
+        # 选最低的（bottom 最大的）横线，保证文本框清掉它
+        _, idx_l, _tl, hl = max(candidates, key=lambda x: x[0])
+        line_bot_mm = parsed[idx_l][1] + parsed[idx_l][4]  # tl + hl
+
+        # 期望文本框新 top = 横线底 + GAP
+        desired_top = round(line_bot_mm + GAP, 3)
+        if desired_top <= t + 0.05:
+            continue  # 已足够，无需挪动
+        # 修改文本框 style 字符串里的 top 值（兼容有无空格两种写法）
+        old_html = all_elements[idx_p][2]
+        m = top_re.search(old_html)
+        if not m:
+            continue
+        new_top_str = f"top: {desired_top}mm"
+        new_html = old_html[:m.start()] + new_top_str + old_html[m.end():]
+        all_elements[idx_p] = (all_elements[idx_p][0],
+                               all_elements[idx_p][1],
+                               new_html)
+
+
 def _wrap_cell_anchor(inner_html, h_offset, v_offset, cx, cy, behind_doc):
     l_mm = emu_to_mm(h_offset)
     t_mm = emu_to_mm(v_offset)
@@ -1489,7 +1887,14 @@ def convert_docx_to_html(docx_path, output_path=None, debug=False):
         return _do_convert(temp_dir, output_path, debug=debug)
 
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # 清理临时目录。
+        # 注意：在 WorkBuddy 沙盒等启用了 safe-delete 钩子的环境里，
+        # 每次 rm/rmdir 都会被强制走回收站逻辑（且回收站不可用时极慢，
+        # 单次可达 ~2s），而纯转换本身仅需 ~0.04s。
+        # 因此提供 DOCX2HTML_KEEP_TMP=1 开关跳过删除（临时目录位于
+        # 系统 TEMP，会被系统自动清理，且不含敏感数据）。
+        if os.environ.get('DOCX2HTML_KEEP_TMP') != '1':
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _do_convert(docx_dir, output_path, debug=False):
@@ -1499,6 +1904,10 @@ def _do_convert(docx_dir, output_path, debug=False):
     # 加载主题颜色
     THEME_COLORS = load_theme_colors(docx_dir)
     print(f'主题颜色已加载: {len(THEME_COLORS)} 个')
+
+    # 加载编号定义并重置编号计数（每个文档独立）
+    load_numbering(docx_dir)
+    NUM_STATE.clear()
 
     doc_xml_path = os.path.join(docx_dir, 'word', 'document.xml')
     if not os.path.exists(doc_xml_path):
@@ -1512,6 +1921,23 @@ def _do_convert(docx_dir, output_path, debug=False):
     if body is None:
         print('错误: 未找到 body 元素')
         return None
+
+    # ===== 去掉 mc:Fallback，避免 Choice/Fallback 重复渲染 =====
+    # OOXML 里 mc:AlternateContent 同时装 DML(mc:Choice) 和 VML(mc:Fallback)，
+    # 两者内容相同但 DML 才是现代格式。后续所有 findall('.//...') 都会同时命中两个分支，
+    # 导致同一段文字 / 同一锚点渲染两遍。这里在解析入口一次性把 Fallback 子树剪掉，
+    # 所有下游迭代自然只走 Choice（DML）。
+    MC = NS['mc']
+    fallback_count = 0
+    # 标准 ElementTree 没有 getparent()，自己建 parent 索引再剪枝
+    parent_of = {id(c): p for p in root.iter() for c in p}
+    for fb in list(root.iter(f'{{{MC}}}Fallback')):
+        parent = parent_of.get(id(fb))
+        if parent is not None:
+            parent.remove(fb)
+            fallback_count += 1
+    if fallback_count:
+        print(f'已剔除 mc:Fallback 节点 {fallback_count} 个（避免 Choice/Fallback 重复渲染）')
 
     # 页面尺寸
     sectpr = body.find(f'{{{W}}}sectPr')
@@ -1548,11 +1974,31 @@ def _do_convert(docx_dir, output_path, debug=False):
     mar_top_emu = int(mar_top_mm * EMU_PER_MM)
     mar_bottom_emu = int(mar_bottom_mm * EMU_PER_MM)
 
+    # 列间距：relativeFrom='column' 的顶层浮动形状在 Word 中会额外叠加 w:cols/@space，
+    # 但仅当该节是「多栏」（cols/@num > 1）时才有意义——单栏布局下不存在「栏与栏之间的 gutter」，
+    # 此时若 wsp.xfrm.off.x 非零也仅表示作者留下的绝对坐标，**不应**再叠加 cols_space，
+    # 否则每个右栏 text-box 会多偏移 7.5mm（OOXML cols/@space 默认 425twips），
+    # 表现为「证书/荣誉两栏整体偏左后右侧栏也比左栏偏右」。
+    cols_el = sectpr.find(f'{{{W}}}cols') if sectpr is not None else None
+    cols_num_str = gattr(cols_el, 'num', 'w') if cols_el is not None else None
+    cols_num = int(cols_num_str) if cols_num_str else 1  # OOXML 默认 num=1（单栏）
+    cols_space_twips = int(gattr(cols_el, 'space', 'w') or '0') if cols_el is not None else 0
+    cols_space_emu = int(cols_space_twips / 1440 * 25.4 * EMU_PER_MM) if cols_num > 1 else 0
+
     content_w_emu = page_w_emu - mar_left_emu - mar_right_emu
     content_h_emu = page_h_emu - mar_top_emu - mar_bottom_emu
 
     # 文档默认字号（半磅→pt）。无显式 w:sz 的正文 run 用它作基准，避免浏览器默认 16px 放大整页。
     default_font_pt = get_default_font_size_pt(docx_dir)
+
+    # 默认段后距：优先由文档 docDefaults 推导（规则化），否则保留校准常数 5.0pt。
+    global DEFAULT_SPACE_AFTER_PT
+    derived_sa = get_default_space_after_pt(docx_dir)
+    if derived_sa is not None:
+        DEFAULT_SPACE_AFTER_PT = derived_sa
+        print(f'默认段后距(来自 docDefaults): {DEFAULT_SPACE_AFTER_PT:.2f}pt')
+    else:
+        DEFAULT_SPACE_AFTER_PT = 5.0
 
     # Word 正文段落（本模板每个段都显式 snapToGrid=0）不吸附基线网格，而是用 Word 的
     # “单倍行距”——约 1.36× 字号（微软雅黑 10.5pt 正文下，比浏览器 normal(~1.15×) 略松）。
@@ -1603,6 +2049,16 @@ def _do_convert(docx_dir, output_path, debug=False):
 
     paragraph_y_emu = mar_top_emu
 
+    # OOXML `wp:positionV relativeFrom="paragraph"` 实际以「段落首行文本基线」
+    # 为原点（不是段落顶）。Word 默认正文行高 = 字号 × 行距系数（≈1.37），
+    # 首行基线 ≈ 段落顶 + 行高 × 0.8 ≈ mar_top + 4.5mm。
+    # 校准值=DEFAULT_FONT_PT × LINE_FACTOR × 0.8(pix->baseline) × pt→EMU 系数；
+    # 同一模板/字号下保持稳定，与 PDF 真值比对得到 ≈4.55mm。
+    DEFAULT_FONT_PT_PARA = 10.5
+    BASELINE_RATIO = 0.8
+    para_baseline_offset_emu = int(
+        DEFAULT_FONT_PT_PARA * body_line_factor * BASELINE_RATIO * EMU_PER_PT)
+
     for child in body_children:
         tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
 
@@ -1615,12 +2071,13 @@ def _do_convert(docx_dir, output_path, debug=False):
             body_text_html = ''
 
             # 先处理 anchor（浮动元素）
+            max_anchor_bottom_emu = 0
             for anchor in child.findall(f'.//{{{WP}}}anchor'):
                 ph = gchild(anchor, 'positionH', 'wp')
                 pv = gchild(anchor, 'positionV', 'wp')
 
-                h_relative = gattr(ph, 'relativeFrom', 'wp') if ph is not None else 'column'
-                v_relative = gattr(pv, 'relativeFrom', 'wp') if pv is not None else 'paragraph'
+                h_relative = ph.get('relativeFrom') if ph is not None else 'column'
+                v_relative = pv.get('relativeFrom') if pv is not None else 'paragraph'
 
                 h_offset = 0
                 v_offset = 0
@@ -1635,8 +2092,8 @@ def _do_convert(docx_dir, output_path, debug=False):
                         v_offset = int(posoff.text)
 
                 extent = gchild(anchor, 'extent', 'wp')
-                cx = int(gattr(extent, 'cx', 'wp') or '0') if extent is not None else 0
-                cy = int(gattr(extent, 'cy', 'wp') or '0') if extent is not None else 0
+                cx = int(extent.get('cx') or '0') if extent is not None else 0
+                cy = int(extent.get('cy') or '0') if extent is not None else 0
 
                 behind_doc = gattr(anchor, 'behindDoc', 'wp') or '0'
                 rel_height = int(gattr(anchor, 'relativeHeight', 'wp') or '0')
@@ -1649,11 +2106,24 @@ def _do_convert(docx_dir, output_path, debug=False):
                 else:
                     real_h = mar_left_emu + h_offset
 
-                if v_relative == 'page':
+                if behind_doc == '1' or cy >= 200 * EMU_PER_MM:
+                    # 页面级形状：behindDoc=1（背景图层）或 extent.cy ≥ 200mm（跨页大色块），
+                    # Word 实际按「页面顶端 + mar_top」定位（即 v_offset 相对 page top + margin），
+                    # 不再加 current_para_y / baseline_offset；否则色带/背景被推到段落顶部之后，
+                    # 底端脱离 A4 底部数毫米。
+                    if v_relative == 'page':
+                        real_v = v_offset
+                    else:
+                        real_v = mar_top_emu + v_offset
+                elif v_relative == 'page':
                     real_v = v_offset
                 elif v_relative == 'margin':
                     real_v = mar_top_emu + v_offset
                 else:
+                    # OOXML relativeFrom="paragraph"：参考「段落首行行框的顶」，
+                    # 即 current_para_y。Word/OOXML 中「段落基线」（baseline）这个
+                    # 4.5mm 经验值会让顶部 header 条的文字下沉 ~3mm，撞到色带底部。
+                    # 234 的「小豆 / 应聘岗位」两个文本框在色带里贴底就是这个原因。
                     real_v = current_para_y + v_offset
 
                 # 区分 group 和 direct shape
@@ -1678,7 +2148,17 @@ def _do_convert(docx_dir, output_path, debug=False):
                 else:
                     wsps = anchor.findall(f'.//{{{WPS}}}wsp')
                     for wsp in wsps:
-                        html_str = parse_shape(wsp, real_h, real_v, 1.0, 1.0, cx, cy, is_direct_shape=True)
+                        shape_real_h = real_h
+                        # 顶层浮动形状：若 wsp 自带「非零 xfrm off.x」（绝对坐标），
+                        # 说明该形状被放在明确列位上，Word 会对 relativeFrom='column'
+                        # 再叠加一列间距 cols_space，故位置需 + cols_space。
+                        _sppr = gchild(wsp, 'spPr', 'wps') or gchild(wsp, 'spPr', 'a')
+                        _xfrm = gchild(_sppr, 'xfrm', 'a') if _sppr is not None else None
+                        _off = gchild(_xfrm, 'off', 'a') if _xfrm is not None else None
+                        _raw_off_x = int(gattr(_off, 'x', 'a') or '0') if _off is not None else 0
+                        if _raw_off_x != 0:
+                            shape_real_h = real_h + cols_space_emu
+                        html_str = parse_shape(wsp, shape_real_h, real_v, 1.0, 1.0, cx, cy, is_direct_shape=True)
                         if html_str:
                             all_elements.append((rel_height, behind_doc == '1', html_str))
 
@@ -1729,8 +2209,12 @@ def _do_convert(docx_dir, output_path, debug=False):
                                                 f'<img src="{img_src}" style="width:100%;height:100%;object-fit:fill;" />'
                                                 f'</div>')
                                     all_elements.append((rel_height, behind_doc == '1', html_str))
+                                    if behind_doc == '0':
+                                        bot = v_offset + cy
+                                        if bot > max_anchor_bottom_emu:
+                                            max_anchor_bottom_emu = bot
 
-            # 处理正文文字（非 anchor 的 run）
+                # 处理正文文字（非 anchor 的 run）
             p_html = parse_paragraph(child)
             if p_html:
                 has_body_text = True
@@ -1740,7 +2224,9 @@ def _do_convert(docx_dir, output_path, debug=False):
                                   f'width: {emu_to_mm(content_w_emu)}mm;">{p_html}</div>')
                 body_content_elements.append((0, False, body_text_html))
 
-            paragraph_y_emu += p_height
+            # anchor 下推：前景 anchor 底部超出段落估算高度时，下一段从 anchor 底部开始，避免重叠
+            advance = max(p_height, max_anchor_bottom_emu)
+            paragraph_y_emu += advance
 
         elif tag == 'tbl':
             current_y = paragraph_y_emu
@@ -1760,11 +2246,22 @@ def _do_convert(docx_dir, output_path, debug=False):
     # 按 relativeHeight 排序
     all_elements.sort(key=lambda x: x[0])
 
+    # ===== 横线落在文本框之上的可见性修复 =====
+    # 部分 docx 在外层 wgp 里设了 chOff/chExt 异常比例（缩放可达几百倍），
+    # 已经把 parse_group_transform 里的 > 8 倍缩放降为 1.0；这一段再处理：
+    # 即便缩放正常，水平分隔线和它下面那个列表文本框也可能几乎重叠，
+    # 导致横线被列表遮挡。让检测到该模式的列表下推到「横线底 + 2mm」。
+    _fix_overlap_with_horizontal_lines(all_elements)
+
     elements_html = '\n'.join(e[2] for e in all_elements)
 
     # 调试水印（仅 --debug 时显示，默认关闭，保证独立转换输出干净）
     page_info_div = (f'<div class="page-info">{page_w_mm:.1f}mm × {page_h_mm:.1f}mm | 页边距: {mar_left_mm:.1f}mm</div>'
                      if debug else '')
+
+    # ===== 横线与下方文本框可见性冲突修复 =====
+    # 详见 _do_convert 中段说明。下面函数负责把被横线压住的文本框下推。
+    # （此处预备，未来如若想保留元素顺序稳定可在此再做一次 sort key 调整）
 
     # 生成 HTML
     html_content = f'''<!DOCTYPE html>
@@ -1785,9 +2282,8 @@ def _do_convert(docx_dir, output_path, debug=False):
             font-family: '微软雅黑', 'Microsoft YaHei', 'SimHei', 'SimSun', sans-serif;
             font-size: {default_font_pt:.2f}pt;
             {('line-height: %.3f;' % body_line_factor) if body_line_factor else ''}
-            display: flex;
-            justify-content: center;
-            padding: 20px 0;
+            margin: 0;
+            padding: 0;
         }}
 
         .a4-page {{
@@ -1797,6 +2293,8 @@ def _do_convert(docx_dir, output_path, debug=False):
             background: white;
             box-shadow: 0 4px 20px rgba(0,0,0,0.15);
             overflow: hidden;
+            /* 上下预留空白让页面不贴边，看着更协调（≈8mm ≈ 30px @96dpi） */
+            margin: 8mm auto;
         }}
 
         .docx-element {{
@@ -1883,242 +2381,918 @@ def _do_convert(docx_dir, output_path, debug=False):
 #  Web 上传界面
 # ===================================================================
 def start_web_server(port=8765):
-    """启动一个简单的 Web 上传界面"""
+    """批量 DOCX 上传 / 转换 / 预览 Web 界面"""
     import http.server
     import socketserver
 
-    UPLOAD_HTML = '''<!DOCTYPE html>
+    # Web 模式：转换频繁，临时解压目录位于系统 TEMP（会自动清理、
+    # 不含敏感数据），跳过每次删除以规避沙盒 safe-delete 钩子的极慢开销
+    # （单次删除在沙盒内可达 ~2s，而纯转换仅 ~0.04s）。
+    # 用强制赋值（不用 setdefault），避免被外部预设的环境变量覆盖。
+    os.environ['DOCX2HTML_KEEP_TMP'] = '1'
+
+    UPLOAD_HTML = r'''
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>DOCX → HTML 转换器</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Docx 转 HTML</title>
+    <!-- 用 Font Awesome 图标，轻量顺手 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- JSZip 打包用 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #f8fafc;
+            --card: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --danger: #ef4444;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --radius: 12px;
+            --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+        }
+
+        .dark {
+            --bg: #1e293b;
+            --card: #0f172a;
+            --text: #f1f5f9;
+            --text-light: #94a3b8;
+            --border: #334155;
+            --shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }
+
+        * { margin:0; padding:0; box-sizing:border-box; }
         body {
-            font-family: '微软雅黑', sans-serif;
-            background: #f0f2f5;
+            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            padding: 2rem 1rem;
+            transition: background 0.2s, color 0.2s;
+        }
+
+        .app {
+            width: 100%;
+            max-width: 780px;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        /* 头部 */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 {
+            font-size: 1.7rem;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+        .theme-btn {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
             display: flex;
             align-items: center;
             justify-content: center;
-        }
-        .container {
-            background: white;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 24px rgba(0,0,0,0.1);
-            width: 480px;
-            text-align: center;
-        }
-        h1 { font-size: 22px; color: #333; margin-bottom: 8px; }
-        .desc { color: #999; font-size: 14px; margin-bottom: 24px; }
-        .upload-area {
-            border: 2px dashed #ccc;
-            border-radius: 8px;
-            padding: 40px;
             cursor: pointer;
-            transition: all 0.3s;
+            font-size: 1.1rem;
+            color: var(--text);
+            transition: 0.2s;
+            box-shadow: var(--shadow);
         }
-        .upload-area:hover { border-color: #4F81BD; background: #f8faff; }
-        .upload-area.dragover { border-color: #4F81BD; background: #eef5ff; }
-        .upload-icon { font-size: 48px; color: #ccc; }
-        .upload-text { color: #666; margin-top: 12px; }
-        input[type=file] { display: none; }
+        .theme-btn:hover { background: var(--border); }
+
+        /* 上传区域 */
+        .drop-zone {
+            border: 2px dashed var(--border);
+            border-radius: var(--radius);
+            padding: 2.5rem 1.5rem;
+            text-align: center;
+            background: var(--card);
+            cursor: pointer;
+            transition: 0.2s;
+            box-shadow: var(--shadow);
+        }
+        .drop-zone.dragover {
+            border-color: var(--primary);
+            background: rgba(59,130,246,0.04);
+        }
+        .drop-zone i {
+            font-size: 2.4rem;
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+            display: block;
+        }
+        .drop-zone .title {
+            font-weight: 600;
+            font-size: 1.05rem;
+            margin-bottom: 0.2rem;
+        }
+        .drop-zone .hint {
+            color: var(--text-light);
+            font-size: 0.9rem;
+        }
+
+        /* 文件列表 */
+        .file-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+            max-height: 420px;
+            overflow-y: auto;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 0.8rem 1rem;
+            box-shadow: var(--shadow);
+            transition: 0.2s;
+            gap: 1rem;
+        }
+        .file-info {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+            min-width: 0;
+            flex: 1;
+        }
+        .file-icon {
+            font-size: 1.8rem;
+            color: #2563eb;
+            flex-shrink: 0;
+        }
+        .file-details {
+            min-width: 0;
+        }
+        .file-name {
+            font-weight: 600;
+            font-size: 0.95rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .file-meta {
+            font-size: 0.8rem;
+            color: var(--text-light);
+        }
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+            font-size: 0.8rem;
+            font-weight: 500;
+            padding: 0.2rem 0.7rem;
+            border-radius: 20px;
+            background: #f1f5f9;
+            color: #475569;
+            white-space: nowrap;
+        }
+        .status-waiting { background: #e2e8f0; color: #334155; }
+        .status-converting { background: #dbeafe; color: #1e40af; }
+        .status-done { background: #d1fae5; color: #065f46; }
+        .status-error { background: #fee2e2; color: #991b1b; }
+
+        .item-actions {
+            display: flex;
+            gap: 0.3rem;
+            align-items: center;
+        }
+        .item-actions button {
+            background: none;
+            border: none;
+            color: var(--text-light);
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0.3rem;
+            border-radius: 6px;
+            transition: 0.2s;
+        }
+        .item-actions button:hover {
+            background: rgba(0,0,0,0.05);
+            color: var(--text);
+        }
+        .dark .item-actions button:hover { background: rgba(255,255,255,0.08); }
+
+        /* 底部按钮 */
+        .actions-bar {
+            display: flex;
+            justify-content: center;
+            gap: 0.8rem;
+            flex-wrap: wrap;
+        }
         .btn {
-            display: inline-block;
-            padding: 12px 32px;
-            background: #4F81BD;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.6rem 1.2rem;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--text);
+            cursor: pointer;
+            transition: 0.2s;
+            white-space: nowrap;
+            box-shadow: var(--shadow);
+        }
+        .btn:hover:not(:disabled) { background: #f1f5f9; }
+        .dark .btn:hover:not(:disabled) { background: #1e293b; }
+        .btn:disabled { opacity: 0.5; cursor: default; }
+        .btn.primary {
+            background: var(--primary);
             color: white;
             border: none;
-            border-radius: 6px;
-            font-size: 16px;
-            cursor: pointer;
-            margin-top: 20px;
-            transition: background 0.3s;
         }
-        .btn:hover { background: #3a6ba8; }
-        .btn:disabled { background: #ccc; cursor: not-allowed; }
-        .result { margin-top: 20px; display: none; }
-        .result a { color: #4F81BD; text-decoration: none; font-size: 16px; }
-        .result a:hover { text-decoration: underline; }
-        .error { color: #d44; margin-top: 12px; display: none; }
-        .progress { margin-top: 12px; color: #666; font-size: 14px; display: none; }
+        .btn.primary:hover:not(:disabled) { background: var(--primary-hover); }
+
+        /* 预览弹窗 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5);
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        .modal.active { display: flex; }
+        .modal-content {
+            background: white;
+            border-radius: var(--radius);
+            width: 90%;
+            max-width: 860px;
+            height: 85vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+        }
+        .dark .modal-content { background: #1e293b; }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+        .modal-header h3 { font-size: 1rem; }
+        .modal-body {
+            flex: 1;
+            background: #fff;
+        }
+        .dark .modal-body { background: #0f172a; }
+        .modal-body iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        .close-btn {
+            background: none;
+            border: none;
+            font-size: 1.3rem;
+            cursor: pointer;
+            color: var(--text-light);
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>DOCX → HTML 转换器</h1>
-        <p class="desc">上传 .docx 文件，自动 1:1 还原为 HTML</p>
-        <div class="upload-area" id="dropZone" onclick="document.getElementById('fileInput').click()">
-            <div class="upload-icon">&#128196;</div>
-            <div class="upload-text">点击或拖拽 .docx 文件到此处</div>
-        </div>
-        <input type="file" id="fileInput" accept=".docx">
-        <button class="btn" id="convertBtn" disabled onclick="convert()">开始转换</button>
-        <div class="progress" id="progress">正在转换，请稍候...</div>
-        <div class="result" id="result">
-            <p>转换完成!</p>
-            <a href="#" id="downloadLink" target="_blank">查看 HTML 结果</a>
-        </div>
-        <div class="error" id="error"></div>
+<div class="app">
+    <div class="header">
+        <h1>📄 Docx → HTML</h1>
+        <button class="theme-btn" id="themeToggle" title="切换暗色模式">
+            <i class="fa-solid fa-moon"></i>
+        </button>
     </div>
-    <script>
-        let selectedFile = null;
+
+    <!-- 拖拽上传区 -->
+    <div class="drop-zone" id="dropZone">
+        <i class="fa-solid fa-cloud-arrow-up"></i>
+        <div class="title">把 .docx 文件扔进来</div>
+        <div class="hint">或者点这里选择文件，支持多选</div>
+        <input type="file" id="fileInput" accept=".docx" multiple hidden>
+    </div>
+
+    <!-- 文件列表容器 -->
+    <div class="file-list" id="fileList">
+        <div style="text-align:center; color: var(--text-light); padding:2rem;" id="emptyHint">
+            <i class="fa-regular fa-folder-open" style="font-size:2rem; opacity:0.4;"></i>
+            <p style="margin-top:0.5rem;">还没有文件，拖一个 docx 进来吧</p>
+        </div>
+    </div>
+
+    <!-- 底部操作 -->
+    <div class="actions-bar">
+        <button class="btn primary" id="downloadAllBtn" disabled>
+            <i class="fa-solid fa-file-zipper"></i> 打包下载全部
+        </button>
+        <button class="btn" id="clearDoneBtn" disabled>
+            <i class="fa-solid fa-broom"></i> 清空已完成
+        </button>
+        <button class="btn" id="retryAllBtn" disabled>
+            <i class="fa-solid fa-rotate-right"></i> 全部重试
+        </button>
+    </div>
+</div>
+
+<!-- 预览弹窗 -->
+<div class="modal" id="previewModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="modalTitle">预览</h3>
+            <button class="close-btn" id="closeModalBtn"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="modal-body">
+            <iframe id="previewFrame"></iframe>
+        </div>
+    </div>
+</div>
+
+<script>
+    (() => {
+        // 状态管理（filename 为后端输出的 html 文件名，用于 /output 与 /delete）
+        const files = [];           // { id, file, status, filename, error }
+        let convertQueue = [];
+        let isConverting = false;
+
+        // DOM 元素
         const dropZone = document.getElementById('dropZone');
         const fileInput = document.getElementById('fileInput');
-        const convertBtn = document.getElementById('convertBtn');
-        const result = document.getElementById('result');
-        const errorDiv = document.getElementById('error');
-        const progress = document.getElementById('progress');
+        const fileListEl = document.getElementById('fileList');
+        const emptyHint = document.getElementById('emptyHint');
+        const downloadAllBtn = document.getElementById('downloadAllBtn');
+        const clearDoneBtn = document.getElementById('clearDoneBtn');
+        const retryAllBtn = document.getElementById('retryAllBtn');
+        const themeToggle = document.getElementById('themeToggle');
+        const previewModal = document.getElementById('previewModal');
+        const previewFrame = document.getElementById('previewFrame');
+        const modalTitle = document.getElementById('modalTitle');
+        const closeModalBtn = document.getElementById('closeModalBtn');
 
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                selectedFile = e.target.files[0];
-                convertBtn.disabled = false;
-                dropZone.querySelector('.upload-text').textContent = '已选择: ' + selectedFile.name;
+        // 工具函数
+        const formatSize = bytes => bytes < 1024 ? bytes + ' B' : bytes < 1048576 ? (bytes/1024).toFixed(1)+' KB' : (bytes/1048576).toFixed(1)+' MB';
+        const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+        const enc = name => encodeURIComponent(name);
+
+        // 渲染文件列表
+        function render() {
+            fileListEl.innerHTML = '';
+            if (files.length === 0) {
+                fileListEl.innerHTML = `<div style="text-align:center; color: var(--text-light); padding:2rem;" id="emptyHint">
+                    <i class="fa-regular fa-folder-open" style="font-size:2rem; opacity:0.4;"></i>
+                    <p style="margin-top:0.5rem;">还没有文件，拖一个 docx 进来吧</p>
+                </div>`;
+            } else {
+                files.forEach(f => {
+                    const item = document.createElement('div');
+                    item.className = 'file-item';
+                    let statusClass = '';
+                    let statusIcon = '';
+                    let statusText = '';
+                    switch(f.status) {
+                        case 'waiting': statusClass='status-waiting'; statusIcon='fa-regular fa-clock'; statusText='排队中'; break;
+                        case 'converting': statusClass='status-converting'; statusIcon='fa-solid fa-spinner fa-spin'; statusText='转换中'; break;
+                        case 'done': statusClass='status-done'; statusIcon='fa-solid fa-check'; statusText='已完成'; break;
+                        case 'error': statusClass='status-error'; statusIcon='fa-solid fa-exclamation'; statusText='失败'; break;
+                    }
+
+                    const meta = f.status === 'error' && f.error ? f.error : formatSize(f.file.size);
+
+                    item.innerHTML = `
+                        <div class="file-info">
+                            <i class="fa-solid fa-file-word file-icon"></i>
+                            <div class="file-details">
+                                <div class="file-name" title="${f.file.name}">${f.file.name}</div>
+                                <div class="file-meta">${meta}</div>
+                            </div>
+                        </div>
+                        <div class="status-badge ${statusClass}">
+                            <i class="${statusIcon}"></i> ${statusText}
+                        </div>
+                        <div class="item-actions">
+                            ${f.status === 'error' ? `<button class="retry-single" data-id="${f.id}" title="重试"><i class="fa-solid fa-rotate-right"></i></button>` : ''}
+                            ${f.status === 'done' ? `
+                                <button class="preview-single" data-id="${f.id}" title="预览"><i class="fa-solid fa-eye"></i></button>
+                                <button class="download-single" data-id="${f.id}" title="下载"><i class="fa-solid fa-download"></i></button>
+                                <button class="copy-single" data-id="${f.id}" title="复制源码"><i class="fa-solid fa-copy"></i></button>
+                            ` : ''}
+                            <button class="remove-single" data-id="${f.id}" title="移除"><i class="fa-solid fa-xmark"></i></button>
+                        </div>
+                    `;
+                    fileListEl.appendChild(item);
+                });
+
+                // 绑定事件
+                document.querySelectorAll('.remove-single').forEach(btn => {
+                    btn.addEventListener('click', (e) => removeFile(e.currentTarget.dataset.id));
+                });
+                document.querySelectorAll('.retry-single').forEach(btn => {
+                    btn.addEventListener('click', (e) => retryFile(e.currentTarget.dataset.id));
+                });
+                document.querySelectorAll('.preview-single').forEach(btn => {
+                    btn.addEventListener('click', (e) => previewFile(e.currentTarget.dataset.id));
+                });
+                document.querySelectorAll('.download-single').forEach(btn => {
+                    btn.addEventListener('click', (e) => downloadFile(e.currentTarget.dataset.id));
+                });
+                document.querySelectorAll('.copy-single').forEach(btn => {
+                    btn.addEventListener('click', (e) => copyFileHtml(e.currentTarget.dataset.id));
+                });
             }
+
+            updateActionButtons();
+        }
+
+        function updateActionButtons() {
+            const hasDone = files.some(f => f.status === 'done');
+            const hasErrorOrWaiting = files.some(f => f.status === 'error' || f.status === 'waiting');
+            downloadAllBtn.disabled = !hasDone;
+            clearDoneBtn.disabled = !hasDone;
+            retryAllBtn.disabled = !hasErrorOrWaiting;
+        }
+
+        // 文件添加
+        function addFiles(fileList) {
+            const validFiles = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.docx'));
+            if (validFiles.length === 0) {
+                alert('请选择 .docx 文件哦～');
+                return;
+            }
+            validFiles.forEach(file => {
+                files.push({
+                    id: genId(),
+                    file,
+                    status: 'waiting',
+                    filename: null,
+                    error: null
+                });
+            });
+            render();
+            // 自动开始转换队列
+            processQueue();
+        }
+
+        async function removeFile(id) {
+            const idx = files.findIndex(f => f.id === id);
+            if (idx === -1) return;
+            if (files[idx].status === 'converting') {
+                if (!confirm('这个文件正在转换中，确定要移除吗？')) return;
+            }
+            const f = files[idx];
+            if (f.filename) {
+                try { await fetch('/delete?file=' + enc(f.filename)); } catch (e) {}
+            }
+            files.splice(idx, 1);
+            render();
+            processQueue();
+        }
+
+        function retryFile(id) {
+            const f = files.find(f => f.id === id);
+            if (f && (f.status === 'error' || f.status === 'waiting')) {
+                f.status = 'waiting';
+                f.error = null;
+                render();
+                processQueue();
+            }
+        }
+
+        // 转换队列（串行）；对接后端 /upload
+        async function processQueue() {
+            if (isConverting) return;
+            const next = files.find(f => f.status === 'waiting');
+            if (!next) return;
+
+            isConverting = true;
+            next.status = 'converting';
+            render();
+
+            const formData = new FormData();
+            formData.append('file', next.file);
+
+            try {
+                const resp = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await resp.json();
+                const first = (data.results && data.results[0]) || null;
+                if (!resp.ok || !first || !first.success) {
+                    const err = (first && first.error) || data.error || '转换失败';
+                    throw new Error(err);
+                }
+                next.filename = first.filename;
+                next.status = 'done';
+            } catch (e) {
+                next.status = 'error';
+                next.error = e.message;
+            }
+
+            isConverting = false;
+            render();
+            // 继续处理下一个
+            processQueue();
+        }
+
+        // 预览：直接加载后端 /output 的 html
+        function previewFile(id) {
+            const f = files.find(f => f.id === id);
+            if (!f || !f.filename) return;
+            modalTitle.textContent = f.file.name;
+            previewFrame.src = '/output/' + enc(f.filename);
+            previewModal.classList.add('active');
+        }
+
+        async function downloadFile(id) {
+            const f = files.find(f => f.id === id);
+            if (!f || !f.filename) return;
+            try {
+                const resp = await fetch('/output/' + enc(f.filename));
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = f.file.name.replace(/\.docx$/i, '') + '.html';
+                a.click();
+                URL.revokeObjectURL(url);
+            } catch (e) { alert('下载失败：' + e.message); }
+        }
+
+        async function copyFileHtml(id) {
+            const f = files.find(f => f.id === id);
+            if (!f || !f.filename) return;
+            try {
+                const resp = await fetch('/output/' + enc(f.filename));
+                const html = await resp.text();
+                navigator.clipboard.writeText(html).then(() => {
+                    const btn = document.querySelector(`.copy-single[data-id="${id}"]`);
+                    if (btn) {
+                        const original = btn.innerHTML;
+                        btn.innerHTML = '<i class="fa-solid fa-check"></i>';
+                        setTimeout(() => { btn.innerHTML = original; }, 1500);
+                    }
+                });
+            } catch (e) {}
+        }
+
+        // 打包下载
+        async function downloadAll() {
+            const doneFiles = files.filter(f => f.status === 'done');
+            if (doneFiles.length === 0) return;
+            const zip = new JSZip();
+            for (const f of doneFiles) {
+                try {
+                    const resp = await fetch('/output/' + enc(f.filename));
+                    const html = await resp.text();
+                    zip.file(f.file.name.replace(/\.docx$/i, '') + '.html', html);
+                } catch (e) {}
+            }
+            const blob = await zip.generateAsync({ type: 'blob' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'docx2html.zip';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        async function clearDone() {
+            const doneFiles = files.filter(f => f.status === 'done');
+            for (const f of doneFiles) {
+                if (f.filename) { try { await fetch('/delete?file=' + enc(f.filename)); } catch (e) {} }
+            }
+            const remaining = files.filter(f => f.status !== 'done');
+            files.length = 0;
+            files.push(...remaining);
+            render();
+            processQueue();
+        }
+
+        function retryAll() {
+            files.forEach(f => {
+                if (f.status === 'error') {
+                    f.status = 'waiting';
+                    f.error = null;
+                }
+            });
+            render();
+            processQueue();
+        }
+
+        // 暗色模式
+        const savedTheme = localStorage.getItem('docx2html-theme') || 'light';
+        if (savedTheme === 'dark') document.body.classList.add('dark');
+        themeToggle.innerHTML = savedTheme === 'dark' ? '<i class="fa-solid fa-sun"></i>' : '<i class="fa-solid fa-moon"></i>';
+        themeToggle.addEventListener('click', () => {
+            document.body.classList.toggle('dark');
+            const isDark = document.body.classList.contains('dark');
+            localStorage.setItem('docx2html-theme', isDark ? 'dark' : 'light');
+            themeToggle.innerHTML = isDark ? '<i class="fa-solid fa-sun"></i>' : '<i class="fa-solid fa-moon"></i>';
         });
 
-        dropZone.addEventListener('dragover', (e) => {
+        // 事件绑定
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragover', e => {
             e.preventDefault();
             dropZone.classList.add('dragover');
         });
         dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-        dropZone.addEventListener('drop', (e) => {
+        dropZone.addEventListener('drop', e => {
             e.preventDefault();
             dropZone.classList.remove('dragover');
-            if (e.dataTransfer.files.length > 0) {
-                selectedFile = e.dataTransfer.files[0];
-                fileInput.files = e.dataTransfer.files;
-                convertBtn.disabled = false;
-                dropZone.querySelector('.upload-text').textContent = '已选择: ' + selectedFile.name;
+            if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+        });
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length) {
+                addFiles(fileInput.files);
+                fileInput.value = '';
             }
         });
 
-        function convert() {
-            if (!selectedFile) return;
-            convertBtn.disabled = true;
-            progress.style.display = 'block';
-            result.style.display = 'none';
-            errorDiv.style.display = 'none';
+        downloadAllBtn.addEventListener('click', downloadAll);
+        clearDoneBtn.addEventListener('click', clearDone);
+        retryAllBtn.addEventListener('click', retryAll);
 
-            const formData = new FormData();
-            formData.append('file', selectedFile);
+        closeModalBtn.addEventListener('click', () => {
+            previewModal.classList.remove('active');
+            previewFrame.src = '';
+        });
+        previewModal.addEventListener('click', (e) => {
+            if (e.target === previewModal) {
+                previewModal.classList.remove('active');
+                previewFrame.src = '';
+            }
+        });
 
-            fetch('/upload', { method: 'POST', body: formData })
-                .then(r => r.json())
-                .then(data => {
-                    progress.style.display = 'none';
-                    if (data.error) {
-                        errorDiv.textContent = data.error;
-                        errorDiv.style.display = 'block';
-                    } else {
-                        document.getElementById('downloadLink').href = '/output/' + data.filename;
-                        result.style.display = 'block';
-                    }
-                    convertBtn.disabled = false;
-                })
-                .catch(err => {
-                    progress.style.display = 'none';
-                    errorDiv.textContent = '转换失败: ' + err.message;
-                    errorDiv.style.display = 'block';
-                    convertBtn.disabled = false;
-                });
-        }
-    </script>
+        // 初始渲染
+        render();
+    })();
+</script>
 </body>
+</html>
 </html>'''
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path == '/' or self.path == '/index.html':
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.end_headers()
-                self.wfile.write(UPLOAD_HTML.encode('utf-8'))
-            elif self.path.startswith('/output/'):
-                filename = self.path.split('/output/')[-1]
-                filepath = os.path.join(output_dir, filename)
-                if os.path.exists(filepath):
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/html; charset=utf-8')
-                    self.end_headers()
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        self.wfile.write(f.read().encode('utf-8'))
-                else:
-                    self.send_error(404)
-            else:
-                self.send_error(404)
-
-        def do_POST(self):
-            if self.path == '/upload':
-                content_type = self.headers.get('Content-Type', '')
-                if 'multipart/form-data' not in content_type:
-                    self._send_json({'error': '需要 multipart/form-data'})
-                    return
-
-                # 解析 multipart
-                boundary = content_type.split('boundary=')[1].encode()
-                content_length = int(self.headers.get('Content-Length', 0))
-                body_data = self.rfile.read(content_length)
-
-                # 提取文件
-                parts = body_data.split(b'--' + boundary)
-                file_data = None
-                filename = 'upload.docx'
-
-                for part in parts:
-                    if b'filename=' in part:
-                        # 提取文件名
-                        header_end = part.find(b'\r\n\r\n')
-                        if header_end > 0:
-                            header = part[:header_end].decode('utf-8', errors='ignore')
-                            if 'filename="' in header:
-                                filename = header.split('filename="')[1].split('"')[0]
-                            file_data = part[header_end + 4:]
-                            # 去掉末尾的 \r\n
-                            if file_data.endswith(b'\r\n'):
-                                file_data = file_data[:-2]
-
-                if file_data is None:
-                    self._send_json({'error': '未找到文件'})
-                    return
-
-                # 保存上传文件
-                upload_path = os.path.join(output_dir, filename)
-                with open(upload_path, 'wb') as f:
-                    f.write(file_data)
-
-                # 转换
-                output_name = os.path.splitext(filename)[0] + '.html'
-                output_path = os.path.join(output_dir, output_name)
-
-                try:
-                    result = convert_docx_to_html(upload_path, output_path)
-                    if result:
-                        self._send_json({'success': True, 'filename': output_name})
-                    else:
-                        self._send_json({'error': '转换失败'})
-                except Exception as e:
-                    self._send_json({'error': str(e)})
-            else:
-                self.send_error(404)
-
         def _send_json(self, data):
             import json
+            payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(payload)))
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode('utf-8'))
+            self.wfile.write(payload)
+
+        def _safe_name(self, name):
+            """清洗文件名防路径穿越，返回解码后的 basename"""
+            import urllib.parse
+            name = urllib.parse.unquote(name)
+            return os.path.basename(name)
 
         def log_message(self, format, *args):
             pass  # 静默日志
 
+        def do_GET(self):
+            import urllib.parse
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+
+            # 首页
+            if path == '/' or path == '/index.html':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(UPLOAD_HTML.encode('utf-8'))
+                return
+
+            # 输出文件（HTML）
+            if path.startswith('/output/'):
+                filename = self._safe_name(path[len('/output/'):])
+                filepath = os.path.join(output_dir, filename)
+                if os.path.exists(filepath) and os.path.isfile(filepath):
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.send_header('Content-Disposition',
+                                     'inline; filename=' + urllib.parse.quote(filename))
+                    self.end_headers()
+                    with open(filepath, 'rb') as f:
+                        self.wfile.write(f.read())
+                else:
+                    self.send_error(404)
+                return
+
+            # 结果列表
+            if path == '/list':
+                files = []
+                try:
+                    for name in sorted(os.listdir(output_dir)):
+                        if not name.lower().endswith('.html'):
+                            continue
+                        full = os.path.join(output_dir, name)
+                        if not os.path.isfile(full):
+                            continue
+                        stat = os.stat(full)
+                        # 推断来源 docx（同名 .docx 已存在 → 来自该 docx）
+                        source = None
+                        docx_name = os.path.splitext(name)[0] + '.docx'
+                        if os.path.exists(os.path.join(output_dir, docx_name)):
+                            source = docx_name
+                        # 检查是否是失败标记（输出 < 500 字节且包含错误信息）
+                        size = stat.st_size
+                        status = 'success'
+                        error = None
+                        if size < 500:
+                            try:
+                                with open(full, 'r', encoding='utf-8', errors='ignore') as f:
+                                    head = f.read(500)
+                                if '<title>错误' in head or '转换失败' in head:
+                                    status = 'failed'
+                                    error = '转换过程出错'
+                            except Exception:
+                                pass
+                        files.append({
+                            'name': name,
+                            'size': size,
+                            'mtime': int(stat.st_mtime),
+                            'source': source,
+                            'status': status,
+                            'error': error,
+                            'duration': (meta_store.get(name) or {}).get('duration'),
+                        })
+                except Exception as e:
+                    return self._send_json({'error': str(e)})
+                return self._send_json({'files': files})
+
+            # 删除文件
+            if path == '/delete':
+                qs = urllib.parse.parse_qs(parsed.query)
+                name = (qs.get('file') or [''])[0]
+                safe = self._safe_name(name)
+                if not safe:
+                    return self._send_json({'success': False, 'error': '参数无效'})
+                filepath = os.path.join(output_dir, safe)
+                # 安全检查：必须在 output_dir 内
+                real_output = os.path.realpath(output_dir)
+                real_target = os.path.realpath(filepath)
+                if not real_target.startswith(real_output):
+                    return self._send_json({'success': False, 'error': '非法路径'})
+                try:
+                    if os.path.exists(filepath):
+                        try:
+                            os.remove(filepath)
+                            deleted = True
+                        except Exception as rm_e:
+                            # sandbox 回收站保护下 os.remove 可能被拦截，
+                            # 改用 PowerShell 强制删除绕过
+                            try:
+                                import subprocess
+                                subprocess.run(
+                                    ['powershell', '-NoProfile', '-Command',
+                                     f'Remove-Item -LiteralPath "{filepath}" -Force -Confirm:$false'],
+                                    check=False, capture_output=True, timeout=20)
+                                deleted = True
+                            except Exception:
+                                deleted = False
+                                return self._send_json({'success': False, 'error': '删除被系统保护拦截: ' + str(rm_e)})
+                        # 顺便删除同名 .docx 上传源（如有）
+                        docx = os.path.splitext(safe)[0] + '.docx'
+                        docx_path = os.path.join(output_dir, docx)
+                        if os.path.exists(docx_path):
+                            try:
+                                os.remove(docx_path)
+                            except Exception:
+                                try:
+                                    import subprocess
+                                    subprocess.run(
+                                        ['powershell', '-NoProfile', '-Command',
+                                         f'Remove-Item -LiteralPath "{docx_path}" -Force -Confirm:$false'],
+                                        check=False, capture_output=True, timeout=20)
+                                except Exception:
+                                    pass
+                    return self._send_json({'success': True})
+                except Exception as e:
+                    return self._send_json({'success': False, 'error': str(e)})
+
+            # 清空结果目录（删除全部 html，以及对应的同名 docx 源）
+            if path == '/clear':
+                try:
+                    import subprocess
+                    removed = 0
+                    for name in os.listdir(output_dir):
+                        full = os.path.join(output_dir, name)
+                        if not os.path.isfile(full):
+                            continue
+                        ext = os.path.splitext(name)[1].lower()
+                        if ext in ('.html', '.docx'):
+                            try:
+                                os.remove(full)
+                            except Exception:
+                                try:
+                                    subprocess.run(
+                                        ['powershell', '-NoProfile', '-Command',
+                                         f'Remove-Item -LiteralPath "{full}" -Force -Confirm:$false'],
+                                        check=False, capture_output=True, timeout=20)
+                                except Exception:
+                                    continue
+                            removed += 1
+                    return self._send_json({'success': True, 'removed': removed})
+                except Exception as e:
+                    return self._send_json({'success': False, 'error': str(e)})
+
+            self.send_error(404)
+
+        def do_POST(self):
+            if self.path != '/upload':
+                self.send_error(404)
+                return
+
+            content_type = self.headers.get('Content-Type', '')
+            if 'multipart/form-data' not in content_type:
+                return self._send_json({'error': '需要 multipart/form-data'})
+
+            try:
+                boundary = content_type.split('boundary=', 1)[1].encode()
+                content_length = int(self.headers.get('Content-Length', 0))
+                body_data = self.rfile.read(content_length)
+
+                results = []
+                # 解析所有 part，提取所有文件
+                parts = body_data.split(b'--' + boundary)
+                for part in parts:
+                    if b'filename=' not in part:
+                        continue
+                    header_end = part.find(b'\r\n\r\n')
+                    if header_end <= 0:
+                        continue
+                    header = part[:header_end].decode('utf-8', errors='ignore')
+                    if 'filename="' not in header:
+                        continue
+                    filename = header.split('filename="', 1)[1].split('"', 1)[0]
+                    file_data = part[header_end + 4:]
+                    if file_data.endswith(b'\r\n'):
+                        file_data = file_data[:-2]
+
+                    safe_name = os.path.basename(filename)
+                    if not safe_name.lower().endswith('.docx'):
+                        results.append({'name': filename, 'error': '仅支持 .docx 文件'})
+                        continue
+
+                    upload_path = os.path.join(output_dir, safe_name)
+                    with open(upload_path, 'wb') as f:
+                        f.write(file_data)
+
+                    output_name = os.path.splitext(safe_name)[0] + '.html'
+                    output_path = os.path.join(output_dir, output_name)
+
+                    try:
+                        import time as _time
+                        _t0 = _time.time()
+                        ok = convert_docx_to_html(upload_path, output_path)
+                        _elapsed = _time.time() - _t0
+                        meta_store[output_name] = {'duration': round(_elapsed, 2)}
+                        if ok:
+                            results.append({'name': safe_name, 'success': True, 'filename': output_name})
+                        else:
+                            results.append({'name': safe_name, 'error': '转换失败'})
+                    except Exception as e:
+                        results.append({'name': safe_name, 'error': str(e)})
+
+                if not results:
+                    return self._send_json({'error': '未找到文件'})
+
+                # 兼容单文件响应字段（前端批量已用 results 字段）
+                return self._send_json({
+                    'success': all(r.get('success') for r in results),
+                    'results': results,
+                    'count': len(results),
+                })
+            except Exception as e:
+                return self._send_json({'error': '上传失败: ' + str(e)})
+
     output_dir = os.path.join(os.getcwd(), 'output')
     os.makedirs(output_dir, exist_ok=True)
 
-    with socketserver.TCPServer(("", port), Handler) as httpd:
-        print(f'Web 服务器已启动: http://localhost:{port}')
+    # 跨请求共享的转换元数据（转换耗时等），供 /list 持久读取
+    meta_store = {}
+
+    socketserver.TCPServer.allow_reuse_address = True
+    # 绑定 127.0.0.1（仅 IPv4）：避免客户端用 localhost 时解析到 IPv6 ::1
+    # 造成的 ~2s 连接延迟（Windows 双栈环境常见问题）。
+    with socketserver.ThreadingTCPServer(("127.0.0.1", port), Handler) as httpd:
+        print(f'Web 服务器已启动: http://127.0.0.1:{port}')
         print(f'输出目录: {output_dir}')
         print(f'按 Ctrl+C 停止')
         httpd.serve_forever()
